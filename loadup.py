@@ -9,7 +9,7 @@ import platform
 import argparse
 import tempfile
 
-VERSION = "0.0.6"
+VERSION = "0.0.7"
 print(f"Version: {VERSION}")
 time.sleep(3)
 
@@ -47,6 +47,9 @@ def setup_docker():
     # Generate Dockerfile in current dir
     dockerfile_content = """
 FROM nvidia/cuda:13.0.0-base-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
 
 RUN apt-get update && apt-get install -y software-properties-common && \\
     add-apt-repository ppa:deadsnakes/ppa -y && apt-get update && \\
