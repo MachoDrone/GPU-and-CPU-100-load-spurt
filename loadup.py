@@ -9,7 +9,7 @@ import platform
 import argparse
 import tempfile
 
-VERSION = "0.0.3"
+VERSION = "0.0.4"
 print(f"Version: {VERSION}")
 time.sleep(3)
 
@@ -48,7 +48,7 @@ def setup_docker():
     dockerfile_content = """
 FROM nvidia/cuda:13.0.0-base-ubuntu22.04
 
-RUN apt-get update && apt-get install -y python3 python3-pip python3-venv lm-sensors && \\
+RUN apt-get update && apt-get install -y python3 python3-pip python3-venv python3-dev build-essential lm-sensors && \\
     rm -rf /var/lib/apt/lists/*
 
 COPY loadup.py /app/loadup.py
@@ -57,8 +57,8 @@ WORKDIR /app
 
 RUN python3 -m venv /app/venv && \\
     . /app/venv/bin/activate && \\
-    pip install numpy psutil && \\
-    pip install torch --index-url https://download.pytorch.org/whl/cu130
+    pip install --no-cache-dir numpy psutil && \\
+    pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu130
 
 CMD ["/app/venv/bin/python", "/app/loadup.py"]
 """
