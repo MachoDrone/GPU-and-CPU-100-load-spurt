@@ -9,7 +9,7 @@ import platform
 import argparse
 import tempfile
 
-VERSION = "0.0.1"
+VERSION = "0.0.2"
 print(f"Version: {VERSION}")
 time.sleep(3)
 
@@ -57,7 +57,8 @@ WORKDIR /app
 
 RUN python3 -m venv /app/venv && \\
     . /app/venv/bin/activate && \\
-    pip install numpy psutil torch --index-url https://download.pytorch.org/whl/cu130
+    pip install numpy psutil && \\
+    pip install torch --index-url https://download.pytorch.org/whl/cu130
 
 CMD ["/app/venv/bin/python", "/app/loadup.py"]
 """
