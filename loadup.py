@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-GPU and CPU stress test with dependency checks and optional Docker isolation.
+Containerized CPU/GPU stress test.
+Version v0.00.2
 """
 from __future__ import annotations
  
@@ -11,508 +12,626 @@ import multiprocessing as mp
 import os
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
  
+__version__ = "0.00.3"
  
-VERSION = "0.0.9"
-DOCKER_IMAGE = "loadup-gpu"
-DOCKER_BASE_IMAGE = "nvidia/cuda:13.0.0-devel-ubuntu22.04"
-TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu130"
-PYTHON_DEPS = ["numpy", "psutil"]
+DEFAULT_BASE_IMAGE = "nvidia/cuda:13.0.0-devel-ubuntu22.04"
+DEFAULT_IMAGE_TAG = "gpu-stress:local"
+CUDA_VERSION_PREFIX = "13.0"
  
-logger = logging.getLogger("loadup")
+DEFAULT_DURATION_SECONDS = 30
+DEFAULT_GPU_ID = 0
+METRICS_INTERVAL_SECONDS = 5
+CPU_MATRIX_SIZE = 5000
+GPU_MATRIX_SIZE = 20000
+ 
+VENV_DIR_DEFAULT = "/opt/venv"
+ 
+PROMPT_DONE_ENV = "STRESS_PROMPTS_DONE"
+GPU_RAW_ENV = "STRESS_GPU_RAW"
+DURATION_RAW_ENV = "STRESS_DURATION_RAW"
+CONTAINER_MODE_ENV = "STRESS_CONTAINER_MODE"
+ 
+CUDA_KEYRING_URL = (
+    "https://developer.download.nvidia.com/compute/cuda/repos/"
+    "ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb"
+)
+ 
+REQUIREMENTS_TEXT = (
+    "--index-url https://download.pytorch.org/whl/cu130\n"
+    "--extra-index-url https://pypi.org/simple\n"
+    "numpy\n"
+    "psutil\n"
+    "torch\n"
+)
+ 
+logger = logging.getLogger("gpu_stress")
  
  
 @dataclass(frozen=True)
-class RuntimeOptions:
-    """Resolved runtime options after prompting and defaults."""
+class PromptData:
+    """Raw prompt values captured at script start."""
+    gpu_raw: str
+    duration_raw: str
  
-    gpu_id: Optional[int]
-    duration: int
+ 
+@dataclass(frozen=True)
+class ContainerEngine:
+    """Container engine command wrapper."""
+    name: str
+    cmd_prefix: List[str]
  
  
 def configure_logging() -> None:
-    """Configure application logging."""
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
- 
- 
-def is_tty() -> bool:
-    """Return True if stdin is a TTY."""
-    try:
-        return os.isatty(sys.stdin.fileno())
-    except Exception:
-        return False
- 
- 
-def stdin_is_piped() -> bool:
-    """Return True if stdin appears to be a pipe or file redirection."""
-    if is_tty():
-        return False
-    try:
-        mode = os.fstat(sys.stdin.fileno()).st_mode
-        return stat.S_ISFIFO(mode) or stat.S_ISREG(mode)
-    except Exception:
-        return False
- 
- 
-def ensure_script_path_from_stdin() -> Optional[str]:
-    """
-    If the script is piped via stdin, write it to a temp file
-    so execv can re-run it later. Returns temp path if created.
-    """
-    existing = os.environ.get("LOADUP_TEMP_SCRIPT")
-    if existing and os.path.exists(existing):
-        sys.argv[0] = existing
-        return existing
- 
-    if not stdin_is_piped():
-        return None
- 
-    try:
-        script_contents = sys.stdin.read()
-    except Exception as exc:
-        logger.error("Failed to read piped script: %s", exc)
-        sys.exit(1)
- 
-    if not script_contents.strip():
-        logger.error("No script content received from stdin.")
-        sys.exit(1)
- 
-    temp_file = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
-    temp_file.write(script_contents)
-    temp_file.close()
-    os.chmod(temp_file.name, 0o755)
-    os.environ["LOADUP_TEMP_SCRIPT"] = temp_file.name
-    sys.argv[0] = temp_file.name
-    return temp_file.name
- 
- 
-def is_in_docker() -> bool:
-    """Check if running inside a Docker container."""
-    if os.path.exists("/.dockerenv"):
-        return True
-    try:
-        with open("/proc/1/cgroup", "r", encoding="utf-8") as handle:
-            content = handle.read()
-        return "docker" in content or "containerd" in content
-    except Exception:
-        return False
- 
- 
-def run_command(
-    cmd: Sequence[str], check: bool = False, capture_output: bool = False
-) -> subprocess.CompletedProcess[str]:
-    """Run a command and return the CompletedProcess."""
-    return subprocess.run(
-        list(cmd),
-        check=check,
-        text=True,
-        capture_output=capture_output,
+    """Configure logging output."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
  
  
-def command_exists(command: str) -> bool:
-    """Return True if a command exists in PATH."""
-    return shutil.which(command) is not None
- 
- 
-def can_use_sudo() -> bool:
-    """Return True if sudo is available and does not prompt."""
-    if not command_exists("sudo"):
-        return False
-    result = run_command(["sudo", "-n", "true"])
-    return result.returncode == 0
- 
- 
-def install_apt_packages(packages: Sequence[str]) -> bool:
-    """Attempt to install apt packages silently; returns True if successful."""
-    if not command_exists("apt-get"):
-        logger.warning("apt-get not available; cannot auto-install: %s", packages)
-        return False
-    if os.geteuid() != 0 and not can_use_sudo():
-        logger.warning("No sudo access; cannot auto-install: %s", packages)
-        return False
- 
-    prefix = ["sudo", "-n"] if os.geteuid() != 0 else []
-    update_cmd = prefix + ["apt-get", "update", "-qq"]
-    install_cmd = prefix + ["apt-get", "install", "-y", "-qq"] + list(packages)
- 
-    logger.info("Installing system dependencies: %s", " ".join(packages))
-    try:
-        run_command(update_cmd, check=True)
-        run_command(install_cmd, check=True)
-        return True
-    except subprocess.CalledProcessError as exc:
-        logger.warning("Failed to install packages: %s", exc)
-        return False
- 
- 
-def ensure_system_dependency(command: str, package_name: str) -> None:
-    """Ensure a system dependency is installed; attempt apt install if missing."""
-    if command_exists(command):
-        return
-    installed = install_apt_packages([package_name])
-    if not installed and command_exists(command):
-        return
-    if not installed:
-        logger.warning(
-            "Missing dependency '%s'. Install with: sudo apt-get install %s",
-            command,
-            package_name,
-        )
- 
- 
-def ensure_python_tooling() -> None:
-    """Ensure venv and pip tooling are available."""
-    try:
-        import venv  # noqa: F401
-    except ImportError:
-        if not install_apt_packages(["python3-venv"]):
-            logger.error("python3-venv is required. Install with: sudo apt-get install python3-venv")
-            sys.exit(1)
- 
-    try:
-        run_command([sys.executable, "-m", "pip", "--version"], check=True)
-    except Exception:
-        if not install_apt_packages(["python3-pip"]):
-            logger.error("pip is required. Install with: sudo apt-get install python3-pip")
-            sys.exit(1)
- 
- 
-def warn_if_missing_nvidia_tools() -> None:
-    """Warn if NVIDIA tools are missing."""
-    if not command_exists("nvidia-smi"):
-        logger.warning(
-            "nvidia-smi not found. Install the NVIDIA driver to enable GPU metrics."
-        )
-    if not command_exists("nvcc"):
-        logger.warning(
-            "nvcc not found. Install CUDA toolkit 13.0 if needed for compilation."
-        )
+def log_version() -> None:
+    """Log the script version."""
+    logger.info("gpu_stress version v%s", __version__)
  
  
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="CPU/GPU Stress Test Script")
-    parser.add_argument("--gpu", type=int, default=None, help="GPU number to stress")
-    parser.add_argument("--duration", type=int, default=None, help="Duration in seconds")
+    parser = argparse.ArgumentParser(description="Containerized CPU/GPU stress test.")
     parser.add_argument(
-        "--no-docker",
-        action="store_true",
-        help="Run on host without Docker",
+        "--gpu-id",
+        type=int,
+        default=None,
+        help="GPU index to stress (overrides prompt).",
     )
+    parser.add_argument(
+        "--no-gpu",
+        action="store_true",
+        help="Disable GPU stress.",
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=None,
+        help="Duration in seconds (overrides prompt).",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["auto", "docker", "podman"],
+        default="auto",
+        help="Container engine to use.",
+    )
+    parser.add_argument(
+        "--base-image",
+        default=DEFAULT_BASE_IMAGE,
+        help="Base CUDA image for the container.",
+    )
+    parser.add_argument(
+        "--tag",
+        default=DEFAULT_IMAGE_TAG,
+        help="Image tag to build/run.",
+    )
+    parser.add_argument(
+        "--force-build",
+        action="store_true",
+        help="Rebuild the container image.",
+    )
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Skip building and use an existing image.",
+    )
+    parser.add_argument("--container", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
  
  
-def prompt_for_int(prompt: str, default: int, minimum: int = 1) -> int:
-    """Prompt for an integer with a default value."""
-    while True:
-        response = input(prompt).strip()
-        if response == "":
-            return default
-        if response.isdigit() and int(response) >= minimum:
-            return int(response)
-        logger.info("Please enter a number >= %d.", minimum)
- 
- 
-def get_gpu_list() -> List[Tuple[int, str]]:
-    """Return a list of available GPUs."""
-    if not command_exists("nvidia-smi"):
-        return []
-    try:
-        result = run_command(["nvidia-smi", "-L"], check=True, capture_output=True)
-        lines = result.stdout.strip().splitlines()
-        gpus: List[Tuple[int, str]] = []
-        for line in lines:
-            if line.startswith("GPU "):
-                parts = line.split(": ", 1)
-                idx = int(parts[0].split(" ")[1])
-                name = parts[1].split(" (")[0].strip()
-                gpus.append((idx, name))
-        return gpus
-    except Exception:
-        return []
- 
- 
-def gather_runtime_options(args: argparse.Namespace) -> RuntimeOptions:
-    """Resolve GPU selection and duration early so prompts show at start."""
-    gpu_id = args.gpu
-    duration = args.duration
-    tty = is_tty()
- 
-    gpus = get_gpu_list() if tty and gpu_id is None else []
-    if gpus:
-        logger.info("Available GPUs:")
-        for idx, name in gpus:
-            logger.info("  %d: %s", idx, name)
-    elif tty and gpu_id is None:
-        logger.info("GPU list unavailable; you can still enter a GPU ID.")
- 
-    if tty and gpu_id is None:
-        response = input("Enter GPU number to stress (blank for 0, or 'n' for none): ")
-        response = response.strip().lower()
-        if response in ("n", "none"):
-            gpu_id = None
-        elif response == "":
-            gpu_id = 0
-        elif response.isdigit():
-            gpu_id = int(response)
-        else:
-            logger.info("Invalid GPU input; defaulting to GPU 0.")
-            gpu_id = 0
-    elif not tty and gpu_id is None:
-        gpu_id = 0
- 
-    if tty and duration is None:
-        duration = prompt_for_int(
-            "Enter number of seconds to run (default 30): ",
-            default=30,
-            minimum=1,
+def collect_prompts(args: argparse.Namespace, container_mode: bool) -> PromptData:
+    """Collect user prompts at the start of the script."""
+    if container_mode:
+        if os.environ.get(PROMPT_DONE_ENV) == "1":
+            return PromptData(
+                gpu_raw=os.environ.get(GPU_RAW_ENV, ""),
+                duration_raw=os.environ.get(DURATION_RAW_ENV, ""),
+            )
+        raise RuntimeError(
+            "Container mode requires prompt values via environment variables."
         )
-    elif duration is None:
-        duration = 30
  
-    return RuntimeOptions(gpu_id=gpu_id, duration=duration)
+    if args.no_gpu:
+        gpu_raw = "none"
+    elif args.gpu_id is not None:
+        gpu_raw = str(args.gpu_id)
+    else:
+        gpu_raw = input(
+            "Enter GPU number to stress (default 0, or 'none' to disable): "
+        ).strip()
  
+    if args.duration is not None:
+        duration_raw = str(args.duration)
+    else:
+        duration_raw = input(
+            "Enter number of seconds to run (default 30): "
+        ).strip()
  
-def ensure_cli_args(sys_args: List[str], options: RuntimeOptions, skip_docker: bool) -> None:
-    """Ensure argv contains resolved options to avoid re-prompting."""
-    if options.gpu_id is not None and "--gpu" not in sys_args:
-        sys_args.extend(["--gpu", str(options.gpu_id)])
-    if options.duration and "--duration" not in sys_args:
-        sys_args.extend(["--duration", str(options.duration)])
-    if skip_docker and "--no-docker" not in sys_args:
-        sys_args.append("--no-docker")
- 
- 
-def build_docker_context(script_path: str) -> str:
-    """Create a temporary Docker build context with script and Dockerfile."""
-    build_dir = tempfile.mkdtemp(prefix="loadup-docker-")
-    dockerfile_path = os.path.join(build_dir, "Dockerfile")
-    script_dest = os.path.join(build_dir, "loadup.py")
- 
-    shutil.copy2(script_path, script_dest)
- 
-    dockerfile_content = f"""
-FROM {DOCKER_BASE_IMAGE}
- 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV TZ=Etc/UTC
- 
-RUN apt-get update -qq && apt-get install -y -qq python3 python3-pip python3-venv lm-sensors && \\
-    rm -rf /var/lib/apt/lists/*
- 
-COPY loadup.py /app/loadup.py
- 
-WORKDIR /app
- 
-RUN python3 -m venv /app/venv && \\
-    /app/venv/bin/python -m pip install --upgrade pip && \\
-    /app/venv/bin/pip install --no-cache-dir numpy psutil && \\
-    /app/venv/bin/pip install --no-cache-dir torch --index-url {TORCH_INDEX_URL}
- 
-CMD ["/app/venv/bin/python", "/app/loadup.py"]
-"""
-    with open(dockerfile_path, "w", encoding="utf-8") as handle:
-        handle.write(dockerfile_content.strip() + "\n")
- 
-    return build_dir
+    return PromptData(gpu_raw=gpu_raw, duration_raw=duration_raw)
  
  
-def run_in_docker(options: RuntimeOptions, script_path: str) -> None:
-    """Build and run the Docker container if available."""
-    if is_in_docker():
-        logger.info("Already running in Docker. Proceeding...")
-        return
- 
-    logger.info("Not in Docker. Setting up container for reliability...")
-    if not command_exists("docker"):
-        if not install_apt_packages(["docker.io"]):
-            logger.warning(
-                "Docker not found. Continuing without Docker. "
-                "Install with: sudo apt-get install docker.io"
-            )
-            return
-        if not command_exists("docker"):
-            logger.warning(
-                "Docker installation did not make docker available. "
-                "Continuing without Docker."
-            )
-            return
- 
-    build_dir = build_docker_context(script_path)
+def parse_duration(raw: str) -> int:
+    """Parse and validate duration input."""
+    if not raw:
+        return DEFAULT_DURATION_SECONDS
     try:
-        run_command(["docker", "build", "-t", DOCKER_IMAGE, build_dir], check=True)
-    except subprocess.CalledProcessError:
-        logger.warning("Docker build failed. Continuing without Docker.")
-        return
-    finally:
-        shutil.rmtree(build_dir, ignore_errors=True)
- 
-    docker_cmd = [
-        "docker",
-        "run",
-        "--gpus",
-        "all",
-        "--rm",
-    ]
-    if is_tty():
-        docker_cmd.append("-it")
-    docker_cmd.append(DOCKER_IMAGE)
- 
-    if options.gpu_id is not None:
-        docker_cmd.extend(["--gpu", str(options.gpu_id)])
-    docker_cmd.extend(["--duration", str(options.duration)])
- 
-    logger.info("Running in Docker container...")
-    temp_script = os.environ.pop("LOADUP_TEMP_SCRIPT", None)
-    if temp_script and os.path.exists(temp_script):
-        os.remove(temp_script)
-    os.execvp("docker", docker_cmd)
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("Duration must be an integer.") from exc
+    if value <= 0:
+        raise ValueError("Duration must be a positive integer.")
+    return value
  
  
-def ensure_venv_and_reexec(options: RuntimeOptions, skip_docker: bool) -> None:
-    """Ensure we are running inside a virtual environment."""
-    if sys.prefix != sys.base_prefix:
-        return
- 
-    ensure_python_tooling()
-    venv_dir = "venv"
-    logger.info("Setting up virtual environment...")
-    if not os.path.exists(venv_dir):
-        try:
-            run_command([sys.executable, "-m", "venv", venv_dir], check=True)
-        except subprocess.CalledProcessError as exc:
-            logger.error("Failed to create venv: %s", exc)
-            sys.exit(1)
- 
-    venv_python = os.path.join(venv_dir, "bin", "python")
-    ensure_cli_args(sys.argv, options, skip_docker=skip_docker)
-    os.execv(venv_python, [venv_python] + sys.argv)
+def parse_gpu_request(raw: str) -> Optional[int]:
+    """Parse and validate GPU selection input."""
+    if not raw:
+        return DEFAULT_GPU_ID
+    lowered = raw.strip().lower()
+    if lowered in {"none", "no", "off", "disable", "cpu"}:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("GPU id must be an integer or 'none'.") from exc
+    if value < 0:
+        raise ValueError("GPU id must be >= 0.")
+    return value
  
  
-def install_python_packages(
-    packages: Sequence[str], extra_args: Sequence[str] = ()
-) -> None:
-    """Install Python packages in current environment."""
-    logger.info("Installing Python packages: %s", " ".join(packages))
-    run_command(
-        [sys.executable, "-m", "pip", "install", "--upgrade"]
-        + list(packages)
-        + list(extra_args),
-        check=True,
+def run_command(
+    command: Sequence[str],
+    capture: bool = False,
+    env: Optional[Dict[str, str]] = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Run a system command."""
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+    stdout = subprocess.PIPE if capture else None
+    stderr = subprocess.STDOUT if capture else None
+    return subprocess.run(
+        list(command),
+        check=check,
+        text=True,
+        stdout=stdout,
+        stderr=stderr,
+        env=merged_env,
     )
  
  
-def ensure_python_dependencies() -> None:
-    """Ensure required Python packages are available."""
-    missing = [pkg for pkg in PYTHON_DEPS if importlib.util.find_spec(pkg) is None]
-    if missing:
-        install_python_packages(missing)
+def is_root() -> bool:
+    """Return True if running as root."""
+    return hasattr(os, "geteuid") and os.geteuid() == 0
  
-    torch_missing = importlib.util.find_spec("torch") is None
-    if torch_missing:
-        install_python_packages(["torch"], extra_args=["--index-url", TORCH_INDEX_URL])
+ 
+def can_sudo_no_prompt() -> bool:
+    """Return True if sudo works without prompting."""
+    if shutil.which("sudo") is None:
+        return False
+    result = subprocess.run(
+        ["sudo", "-n", "true"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+ 
+ 
+def get_privilege_prefix(allow_sudo: bool) -> List[str]:
+    """Return command prefix for privileged operations."""
+    if is_root():
+        return []
+    if allow_sudo and can_sudo_no_prompt():
+        return ["sudo", "-n"]
+    raise RuntimeError("Root or passwordless sudo is required for installation.")
+ 
+ 
+def apt_install(packages: Sequence[str], allow_sudo: bool) -> None:
+    """Install apt packages quietly."""
+    if not packages:
+        return
+    if shutil.which("apt-get") is None:
+        raise RuntimeError("apt-get not available for installation.")
+    prefix = get_privilege_prefix(allow_sudo)
+    env = {"DEBIAN_FRONTEND": "noninteractive"}
+    run_command(prefix + ["apt-get", "update", "-qq"], env=env)
+    run_command(
+        prefix
+        + [
+            "apt-get",
+            "install",
+            "-y",
+            "-qq",
+            "--no-install-recommends",
+        ]
+        + list(packages),
+        env=env,
+    )
+ 
+ 
+def maybe_install_package(package: str, friendly_name: str) -> None:
+    """Attempt to install a host package with apt-get."""
+    try:
+        apt_install([package], allow_sudo=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"{friendly_name} is required. Install with: sudo apt-get install -y {package}"
+        ) from exc
+ 
+ 
+def is_wsl() -> bool:
+    """Return True if running under WSL."""
+    return os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop")
+ 
+ 
+def nested_podman_available() -> bool:
+    """Return True if nested Podman is reachable via docker exec."""
+    try:
+        run_command(["docker", "exec", "podman", "podman", "-v"], capture=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+ 
+ 
+def ensure_docker_engine() -> ContainerEngine:
+    """Ensure Docker is available and return engine wrapper."""
+    if shutil.which("docker") is None:
+        logger.info("Docker not found; attempting installation...")
+        try:
+            maybe_install_package("docker.io", "Docker")
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+    if shutil.which("docker") is None:
+        raise RuntimeError(
+            "Docker is required. Install with: sudo apt-get install -y docker.io"
+        )
+    return ContainerEngine(name="docker", cmd_prefix=["docker"])
+ 
+ 
+def ensure_podman_engine() -> ContainerEngine:
+    """Ensure Podman is available and return engine wrapper."""
+    if is_wsl():
+        if shutil.which("podman") is None:
+            logger.info("Podman not found; attempting installation...")
+            try:
+                maybe_install_package("podman", "Podman")
+            except RuntimeError as exc:
+                logger.error("%s", exc)
+        if shutil.which("podman") is None:
+            raise RuntimeError(
+                "Podman is required on WSL. Install with: sudo apt-get install -y podman"
+            )
+        return ContainerEngine(name="podman", cmd_prefix=["podman"])
+ 
+    # Native Linux Podman uses a nested container, per requirements.
+    if shutil.which("docker") is None:
+        raise RuntimeError(
+            "Podman on native Linux requires Docker and a running 'podman' container."
+        )
+    if not nested_podman_available():
+        raise RuntimeError(
+            "Nested Podman not available. Start a container named 'podman' "
+            "or install Docker and use --engine docker."
+        )
+    return ContainerEngine(
+        name="podman",
+        cmd_prefix=["docker", "exec", "podman", "podman"],
+    )
+ 
+ 
+def detect_engine(preferred: str) -> ContainerEngine:
+    """Select container engine based on preference."""
+    if preferred == "docker":
+        return ensure_docker_engine()
+    if preferred == "podman":
+        return ensure_podman_engine()
+    try:
+        return ensure_docker_engine()
+    except RuntimeError as exc:
+        logger.warning("Docker unavailable: %s", exc)
+        return ensure_podman_engine()
+ 
+ 
+def engine_run(
+    engine: ContainerEngine,
+    args: Sequence[str],
+    capture: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run a container engine command."""
+    return run_command(engine.cmd_prefix + list(args), capture=capture)
+ 
+ 
+def image_exists(engine: ContainerEngine, tag: str) -> bool:
+    """Return True if the image tag exists."""
+    try:
+        engine_run(engine, ["image", "inspect", tag], capture=True)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+ 
+ 
+def render_dockerfile(base_image: str) -> str:
+    """Return Dockerfile contents."""
+    return (
+        f"FROM {base_image}\n"
+        "ENV DEBIAN_FRONTEND=noninteractive\n"
+        "ENV PYTHONUNBUFFERED=1\n"
+        "RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends "
+        "python3 python3-venv python3-pip ca-certificates lm-sensors && "
+        "rm -rf /var/lib/apt/lists/*\n"
+        "WORKDIR /app\n"
+        "COPY requirements.txt /app/requirements.txt\n"
+        "RUN pip3 install --no-cache-dir --quiet --upgrade pip setuptools wheel && "
+        "pip3 install --no-cache-dir --quiet -r /app/requirements.txt\n"
+        "COPY gpu_stress.py /app/gpu_stress.py\n"
+        "RUN chmod +x /app/gpu_stress.py\n"
+        "ENTRYPOINT [\"python3\", \"/app/gpu_stress.py\", \"--container\"]\n"
+    )
+ 
+ 
+def build_image(
+    engine: ContainerEngine,
+    base_image: str,
+    tag: str,
+    script_path: Path,
+) -> None:
+    """Build the container image from a temporary context."""
+    if not script_path.exists():
+        raise RuntimeError(f"Script path not found: {script_path}")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        dockerfile_path = temp_path / "Dockerfile"
+        requirements_path = temp_path / "requirements.txt"
+        script_dest = temp_path / "gpu_stress.py"
+ 
+        dockerfile_path.write_text(render_dockerfile(base_image), encoding="utf-8")
+        requirements_path.write_text(REQUIREMENTS_TEXT, encoding="utf-8")
+        shutil.copy2(script_path, script_dest)
+        script_dest.chmod(0o755)
+ 
+        # For nested Podman, ensure the context is accessible to that container.
+        engine_run(engine, ["build", "-t", tag, str(temp_path)])
+ 
+ 
+def run_container(
+    engine: ContainerEngine,
+    tag: str,
+    env_vars: Dict[str, str],
+    gpu_enabled: bool,
+) -> None:
+    """Run the container image with the provided environment."""
+    cmd: List[str] = ["run", "--rm"]
+    if gpu_enabled:
+        if engine.name == "docker":
+            cmd += ["--gpus", "all"]
+        else:
+            # Podman GPU support relies on NVIDIA OCI hooks.
+            cmd += ["--hooks-dir=/usr/share/containers/oci/hooks.d"]
+    for key, value in env_vars.items():
+        cmd += ["-e", f"{key}={value}"]
+    cmd.append(tag)
+    engine_run(engine, cmd)
+ 
+ 
+def install_cuda_toolkit() -> None:
+    """Install CUDA toolkit 13.0 via NVIDIA keyring."""
+    apt_install(["wget", "gnupg", "ca-certificates"], allow_sudo=True)
+    prefix = get_privilege_prefix(allow_sudo=True)
+    env = {"DEBIAN_FRONTEND": "noninteractive"}
+    run_command(["wget", "-q", "-O", "/tmp/cuda-keyring.deb", CUDA_KEYRING_URL])
+    run_command(prefix + ["dpkg", "-i", "/tmp/cuda-keyring.deb"], env=env)
+    run_command(prefix + ["apt-get", "update", "-qq"], env=env)
+    run_command(
+        prefix
+        + [
+            "apt-get",
+            "install",
+            "-y",
+            "-qq",
+            "--no-install-recommends",
+            "cuda-toolkit-13-0",
+        ],
+        env=env,
+    )
+ 
+ 
+def ensure_nvcc() -> None:
+    """Ensure CUDA toolkit nvcc is available and correct version."""
+    if shutil.which("nvcc"):
+        output = run_command(["nvcc", "--version"], capture=True).stdout or ""
+        if f"release {CUDA_VERSION_PREFIX}" in output:
+            return
+        raise RuntimeError(
+            f"CUDA version mismatch. Expected {CUDA_VERSION_PREFIX}."
+        )
+ 
+    logger.info("CUDA toolkit not found; installing CUDA %s...", CUDA_VERSION_PREFIX)
+    install_cuda_toolkit()
+ 
+    if shutil.which("nvcc") is None:
+        raise RuntimeError("nvcc still not found after installation.")
+ 
+ 
+def ensure_nvidia_smi() -> None:
+    """Ensure nvidia-smi is available when GPU is requested."""
+    if shutil.which("nvidia-smi") is None:
+        raise RuntimeError(
+            "nvidia-smi not found. Ensure the NVIDIA driver is installed on the host "
+            "and run the container with GPU access."
+        )
+ 
+ 
+def ensure_lm_sensors() -> bool:
+    """Ensure lm-sensors is installed for CPU temperature metrics."""
+    if shutil.which("sensors") is not None:
+        return True
+    try:
+        apt_install(["lm-sensors"], allow_sudo=True)
+    except RuntimeError as exc:
+        logger.warning("lm-sensors not installed: %s", exc)
+        return False
+    return shutil.which("sensors") is not None
+ 
+ 
+def ensure_container_system_deps(require_gpu: bool) -> bool:
+    """Ensure system dependencies inside the container."""
+    sensors_available = ensure_lm_sensors()
+    if require_gpu:
+        ensure_nvcc()
+        ensure_nvidia_smi()
+    return sensors_available
+ 
+ 
+def get_venv_dir() -> Path:
+    """Return a writable virtual environment directory."""
+    base = Path(VENV_DIR_DEFAULT)
+    if base.parent.exists() and os.access(base.parent, os.W_OK):
+        return base
+    return Path.home() / ".gpu-stress-venv"
+ 
+ 
+def install_requirements(pip_exe: str, requirements_text: str) -> None:
+    """Install Python requirements using pip."""
+    with tempfile.NamedTemporaryFile("w", delete=False) as handle:
+        handle.write(requirements_text)
+        req_path = handle.name
+    try:
+        run_command(
+            [
+                pip_exe,
+                "install",
+                "--quiet",
+                "--no-cache-dir",
+                "--upgrade",
+                "pip",
+                "setuptools",
+                "wheel",
+            ]
+        )
+        run_command(
+            [pip_exe, "install", "--quiet", "--no-cache-dir", "-r", req_path]
+        )
+    finally:
+        try:
+            os.unlink(req_path)
+        except OSError:
+            pass
+ 
+ 
+def ensure_virtualenv() -> None:
+    """Ensure a virtual environment is active."""
+    if sys.prefix != sys.base_prefix:
         return
  
+    venv_dir = get_venv_dir()
+    venv_python = venv_dir / "bin" / "python"
+    venv_pip = venv_dir / "bin" / "pip"
+ 
+    if not venv_dir.exists():
+        try:
+            run_command([sys.executable, "-m", "venv", str(venv_dir)])
+        except subprocess.CalledProcessError:
+            logger.info("python3-venv missing; installing...")
+            apt_install(["python3-venv"], allow_sudo=True)
+            run_command([sys.executable, "-m", "venv", str(venv_dir)])
+ 
+    if not venv_pip.exists():
+        raise RuntimeError("pip not found in the virtual environment.")
+ 
+    install_requirements(str(venv_pip), REQUIREMENTS_TEXT)
+    os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+ 
+ 
+def ensure_python_deps() -> None:
+    """Ensure numpy, psutil, and torch are installed."""
+    missing = [
+        pkg
+        for pkg in ("numpy", "psutil", "torch")
+        if importlib.util.find_spec(pkg) is None
+    ]
+    if not missing:
+        return
+    pip_path = Path(sys.executable).with_name("pip")
+    pip_cmd = str(pip_path) if pip_path.exists() else shutil.which("pip")
+    if not pip_cmd:
+        raise RuntimeError("pip not available. Install python3-pip.")
+    logger.info("Installing missing Python packages: %s", ", ".join(missing))
+    install_requirements(pip_cmd, REQUIREMENTS_TEXT)
+ 
+ 
+def check_torch_cuda(require_gpu: bool) -> None:
+    """Validate torch and CUDA availability."""
     try:
-        import torch  # type: ignore
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("Torch not installed correctly.") from exc
  
-        if not torch.version.cuda or "13.0" not in torch.version.cuda:
-            logger.info("Reinstalling torch for CUDA 13.0 support...")
-            install_python_packages(["torch"], extra_args=["--index-url", TORCH_INDEX_URL])
-    except Exception as exc:
-        logger.warning("Torch check failed (%s). Reinstalling...", exc)
-        install_python_packages(["torch"], extra_args=["--index-url", TORCH_INDEX_URL])
+    logger.info("Torch version: %s", torch.__version__)
+    cuda_version = torch.version.cuda or "unknown"
+    logger.info("CUDA version in Torch: %s", cuda_version)
  
- 
-def validate_gpu_id(gpu_id: Optional[int]) -> Optional[int]:
-    """Validate GPU ID against available GPUs."""
-    if gpu_id is None:
-        return None
-    gpus = get_gpu_list()
-    if not gpus:
-        logger.warning("No NVIDIA GPUs detected. GPU stress disabled.")
-        return None
-    if gpu_id not in [idx for idx, _ in gpus]:
-        logger.error("Invalid GPU number %d. Exiting.", gpu_id)
-        sys.exit(1)
-    return gpu_id
- 
- 
-def check_torch_cuda() -> bool:
-    """Check if PyTorch CUDA is available."""
-    try:
-        import torch  # type: ignore
- 
-        if torch.cuda.is_available():
-            logger.info("PyTorch CUDA available: %s", torch.version.cuda)
-            return True
-        logger.warning("PyTorch CUDA not available.")
-        return False
-    except ImportError:
-        logger.warning("Torch not installed correctly.")
-        return False
- 
- 
-def cpu_stress_worker() -> None:
-    """CPU stress worker that runs heavy matrix multiplications."""
-    import numpy as np  # type: ignore
- 
-    while True:
-        a = np.random.rand(5000, 5000)
-        b = np.random.rand(5000, 5000)
-        np.dot(a, b)
- 
- 
-def gpu_stress(gpu_id: int) -> None:
-    """GPU stress worker using CUDA tensors."""
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    try:
-        import torch  # type: ignore
- 
-        logger.info("Torch version: %s", torch.__version__)
-        logger.info("CUDA version in Torch: %s", torch.version.cuda)
+    if require_gpu:
         if not torch.cuda.is_available():
-            logger.warning("CUDA not available on GPU %d. GPU stress disabled.", gpu_id)
-            return
-        device = torch.device("cuda")
-        logger.info("Using device: %s", torch.cuda.get_device_name(device))
-        size = 20000
-        while True:
-            a = torch.rand(size, size, device=device)
-            b = torch.rand(size, size, device=device)
-            for _ in range(10):
-                torch.mm(a, b)
-            torch.cuda.synchronize()
-            logger.info("Completed GPU stress iteration")
+            raise RuntimeError(
+                "PyTorch CUDA not available. Ensure CUDA toolkit and drivers are installed."
+            )
+        if not cuda_version.startswith(CUDA_VERSION_PREFIX):
+            raise RuntimeError(
+                f"CUDA version mismatch. Expected {CUDA_VERSION_PREFIX}."
+            )
+ 
+ 
+def get_gpu_list() -> List[Tuple[int, str]]:
+    """Return list of available GPUs."""
+    try:
+        output = run_command(["nvidia-smi", "-L"], capture=True).stdout or ""
     except Exception as exc:
-        logger.warning("GPU stress error: %s", exc)
+        logger.error("Error listing GPUs: %s", exc)
+        return []
+ 
+    gpus: List[Tuple[int, str]] = []
+    for line in output.strip().splitlines():
+        if line.startswith("GPU "):
+            parts = line.split(": ", 1)
+            idx = int(parts[0].split(" ")[1])
+            name = parts[1].split(" (")[0].strip()
+            gpus.append((idx, name))
+    return gpus
  
  
 def get_gpu_metrics(gpu_id: int) -> Optional[Dict[str, str]]:
-    """Return GPU metrics using nvidia-smi."""
-    if not command_exists("nvidia-smi"):
-        return None
+    """Collect GPU metrics using nvidia-smi."""
+    command = [
+        "nvidia-smi",
+        "-i",
+        str(gpu_id),
+        "--query-gpu=fan.speed,pstate,power.draw,power.limit,memory.used,"
+        "memory.total,utilization.gpu,temperature.gpu,"
+        "clocks_throttle_reasons.hw_thermal_slowdown,"
+        "clocks_throttle_reasons.sw_thermal_slowdown",
+        "--format=csv,noheader",
+    ]
     try:
-        command = [
-            "nvidia-smi",
-            "-i",
-            str(gpu_id),
-            "--query-gpu=fan.speed,pstate,power.draw,power.limit,memory.used,"
-            "memory.total,utilization.gpu,temperature.gpu,"
-            "clocks_throttle_reasons.hw_thermal_slowdown,"
-            "clocks_throttle_reasons.sw_thermal_slowdown",
-            "--format=csv,noheader",
-        ]
-        output = run_command(command, check=True, capture_output=True).stdout.strip()
-        metrics = output.split(", ")
+        output = run_command(command, capture=True).stdout or ""
+        metrics = [item.strip() for item in output.split(",")]
+        if len(metrics) < 10:
+            raise RuntimeError("Unexpected nvidia-smi output.")
         return {
             "Fan Speed": metrics[0],
             "Perf (P-State)": metrics[1],
@@ -524,941 +643,26 @@ def get_gpu_metrics(gpu_id: int) -> Optional[Dict[str, str]]:
             "SW Throttle": metrics[9],
         }
     except Exception as exc:
-        logger.warning("Error querying nvidia-smi for GPU %d: %s", gpu_id, exc)
-        return None
- 
- 
-def get_cpu_metrics() -> Dict[str, str]:
-    """Return CPU utilization, frequency, and temperature."""
-    import psutil  # type: ignore
- 
-    cpu_percent = psutil.cpu_percent(interval=0.1)
-    cpu_freq = psutil.cpu_freq()
-    freq_current = cpu_freq.current if cpu_freq else "N/A"
- 
-    temp = "N/A"
-    if command_exists("sensors"):
-        try:
-            temp_output = run_command(["sensors"], check=True, capture_output=True).stdout
-            match = re.search(r"Package id 0:\s+\+([\d.]+)°C", temp_output)
-            temp = f"{match.group(1)}°C" if match else "N/A"
-        except Exception:
-            temp = "N/A"
-    else:
-        temp = "N/A (lm-sensors not installed)"
- 
-    return {
-        "CPU Utilization": f"{cpu_percent}%",
-        "CPU Frequency": f"{freq_current} MHz" if freq_current != "N/A" else "N/A",
-        "CPU Temperature": temp,
-    }
- 
- 
-def get_ram_metrics() -> Dict[str, str]:
-    """Return RAM usage metrics."""
-    import psutil  # type: ignore
- 
-    mem = psutil.virtual_memory()
-    return {
-        "RAM Usage/Cap": f"{mem.used / (1024**2):.1f} MiB / {mem.total / (1024**2):.1f} MiB",
-        "RAM Utilization": f"{mem.percent}%",
-    }
- 
- 
-def get_storage_metrics() -> Dict[str, str]:
-    """Return storage I/O metrics."""
-    import psutil  # type: ignore
- 
-    io1 = psutil.disk_io_counters()
-    time.sleep(1)
-    io2 = psutil.disk_io_counters()
- 
-    read_rate = (io2.read_bytes - io1.read_bytes) / (1024**2)
-    write_rate = (io2.write_bytes - io1.write_bytes) / (1024**2)
- 
-    return {
-        "Disk Read Rate": f"{read_rate:.2f} MB/s",
-        "Disk Write Rate": f"{write_rate:.2f} MB/s",
-    }
- 
- 
-def color_text(text: str, color_code: str) -> str:
-    """Return ANSI-colored text."""
-    return f"\033[{color_code}m{text}\033[0m"
- 
- 
-def log_blue(text: str) -> None:
-    """Log blue-colored text."""
-    logger.info(color_text(text, "94"))
- 
- 
-def log_red(text: str) -> None:
-    """Log red-colored text."""
-    logger.info(color_text(text, "91"))
- 
- 
-def cleanup_environment() -> None:
-    """Clean up venv, Docker image, and temp script if requested."""
-    if os.path.exists("venv"):
-        run_command(["rm", "-rf", "venv"])
- 
-    if command_exists("docker"):
-        run_command(["docker", "rmi", DOCKER_IMAGE])
- 
-    temp_script = os.environ.get("LOADUP_TEMP_SCRIPT")
-    if temp_script and os.path.exists(temp_script):
-        os.remove(temp_script)
- 
- 
-def run_stress_test(gpu_id: Optional[int], duration: int) -> None:
-    """Run CPU and optional GPU stress while printing metrics."""
-    try:
-        mp.set_start_method("spawn")
-    except RuntimeError:
-        pass
- 
-    num_cores = mp.cpu_count()
-    cpu_processes = [mp.Process(target=cpu_stress_worker) for _ in range(num_cores)]
-    for process in cpu_processes:
-        process.daemon = True
-        process.start()
- 
-    gpu_process = None
-    if gpu_id is not None:
-        gpu_process = mp.Process(target=gpu_stress, args=(gpu_id,))
-        gpu_process.daemon = True
-        gpu_process.start()
- 
-    start_time = time.time()
-    try:
-        while time.time() - start_time < duration:
-            if gpu_id is not None:
-                gpu_data = get_gpu_metrics(gpu_id)
-                if gpu_data:
-                    logger.info("GPU Metrics:")
-                    for key, value in gpu_data.items():
-                        logger.info("  %s: %s", key, value)
- 
-            cpu_data = get_cpu_metrics()
-            logger.info("\nCPU Metrics:")
-            for key, value in cpu_data.items():
-                logger.info("  %s: %s", key, value)
- 
-            logger.info("\n%s\n", "-" * 40)
-            time.sleep(5)
-    except KeyboardInterrupt:
-        logger.info("Stopping stress test early.")
-    finally:
-        logger.info("Stress test completed.")
-        for process in cpu_processes:
-            process.terminate()
-        if gpu_process:
-            gpu_process.terminate()
- 
-        time.sleep(2)
-        log_blue("-" * 40)
-        log_blue("Completed Full Load -- CHECK FOR IDLE/NORMALCY")
- 
-        if gpu_id is not None:
-            gpu_data = get_gpu_metrics(gpu_id)
-            if gpu_data:
-                log_blue("GPU Metrics:")
-                for key, value in gpu_data.items():
-                    log_blue(f"{key}: {value}")
- 
-        cpu_data = get_cpu_metrics()
-        log_blue("\nCPU Metrics:")
-        for key, value in cpu_data.items():
-            log_blue(f"{key}: {value}")
- 
-        ram_data = get_ram_metrics()
-        log_blue("\nRAM Metrics:")
-        for key, value in ram_data.items():
-            log_blue(f"{key}: {value}")
- 
-        storage_data = get_storage_metrics()
-        log_blue("\nStorage Metrics:")
-        for key, value in storage_data.items():
-            log_blue(f"{key}: {value}")
- 
-        logger.info("\nyou can cleanup now or cleanup later by running this script again")
-        if is_tty():
-            cleanup_input = input(color_text("Cleanup now? (Y/n): ", "91")).strip().lower()
-            do_cleanup = cleanup_input in ("", "y")
-        else:
-            logger.info("No TTY detected. Skipping cleanup prompt.")
-            do_cleanup = False
- 
-        if do_cleanup:
-            cleanup_environment()
-            logger.info("Cleanup completed.")
-        else:
-            logger.info("Cleanup skipped.")
- 
- 
-def main() -> int:
-    """Entry point."""
-    configure_logging()
-    logger.info("Version: %s", VERSION)
- 
-    ensure_script_path_from_stdin()
-    script_path = os.path.abspath(sys.argv[0])
-    args = parse_args()
-    options = gather_runtime_options(args)
- 
-    skip_docker = args.no_docker
-    if not skip_docker:
-        run_in_docker(options, script_path)
-        skip_docker = True
- 
-    ensure_venv_and_reexec(options, skip_docker=skip_docker)
- 
-    ensure_system_dependency("sensors", "lm-sensors")
-    warn_if_missing_nvidia_tools()
- 
-    ensure_python_dependencies()
- 
-    gpu_id = validate_gpu_id(options.gpu_id)
-    if gpu_id is not None and not check_torch_cuda():
-        logger.warning("CUDA unavailable in torch. GPU stress disabled.")
-        gpu_id = None
- 
-    logger.info(
-        "Starting CPU and GPU stress test for %d seconds on GPU %s. "
-        "Press Ctrl+C to stop early.",
-        options.duration,
-        gpu_id if gpu_id is not None else "N/A",
-    )
-    logger.info("Metrics will update every 5 seconds.\n")
- 
-    run_stress_test(gpu_id, options.duration)
- 
-    temp_script = os.environ.get("LOADUP_TEMP_SCRIPT")
-    if temp_script and os.path.exists(temp_script):
-        os.remove(temp_script)
- 
-    return 0
- 
- 
-if __name__ == "__main__":
-    sys.exit(main())
-md@nn01:~$ curl -s https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py | python3 -
-Version: 0.0.9
-No script content received from stdin.
-md@nn01:~$
-
-Worked for 3m 37s
-Fixed the stdin execution path so curl ... | python3 - no longer errors out. The script now attempts to recover its source from linecache/inspect; if that fails, it warns and continues without Docker/venv re-exec (dependencies still install in the current interpreter). Version bumped to 0.0.10.
-
-Test run
-
-python3 -m py_compile /workspace/loadup.py
-You can rerun:
-
-curl -s https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py | python3 -
-If you want Docker/venv re-exec to be guaranteed, run:
-
-curl -o loadup.py https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py
-python3 loadup.py
-i didn't understand the instructions and that is ok, but i only ran this:
-md@nn01:~$ curl -o loadup.py https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py
-python3 loadup.py
-  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
-                                 Dload  Upload   Total   Spent    Left  Speed
-100 24137  100 24137    0     0   168k      0 --:--:-- --:--:-- --:--:--  168k
-Version: 0.0.9
-Available GPUs:
-  0: NVIDIA GeForce RTX 4090
-  1: NVIDIA RTX A4000
-  2: NVIDIA GeForce RTX 3060
-Enter GPU number to stress (blank for 0, or 'n' for none): 0
-Enter number of seconds to run (default 30): 
-Not in Docker. Setting up container for reliability...
-[+] Building 87.4s (10/10) FINISHED                                                                                                                                                                                       docker:default
- => [internal] load build definition from Dockerfile                                                                                                                                                                                0.0s
- => => transferring dockerfile: 622B                                                                                                                                                                                                0.0s
- => [internal] load metadata for docker.io/nvidia/cuda:13.0.0-devel-ubuntu22.04                                                                                                                                                     0.4s
- => [internal] load .dockerignore                                                                                                                                                                                                   0.0s
- => => transferring context: 2B                                                                                                                                                                                                     0.0s
- => CACHED [1/5] FROM docker.io/nvidia/cuda:13.0.0-devel-ubuntu22.04@sha256:1470d2d7904fac4e5cb3bdfd4993305c46d3ee76deb0213eaaf248e5cf9c7400                                                                                        0.0s
- => [internal] load build context                                                                                                                                                                                                   0.0s
- => => transferring context: 24.18kB                                                                                                                                                                                                0.0s
- => [2/5] RUN apt-get update -qq && apt-get install -y -qq python3 python3-pip python3-venv lm-sensors &&     rm -rf /var/lib/apt/lists/*                                                                                           8.3s
- => [3/5] COPY loadup.py /app/loadup.py                                                                                                                                                                                             0.0s 
- => [4/5] WORKDIR /app                                                                                                                                                                                                              0.0s 
- => [5/5] RUN python3 -m venv /app/venv &&     /app/venv/bin/python -m pip install --upgrade pip &&     /app/venv/bin/pip install --no-cache-dir numpy psutil &&     /app/venv/bin/pip install --no-cache-dir torch --index-url h  69.7s 
- => exporting to image                                                                                                                                                                                                              8.7s 
- => => exporting layers                                                                                                                                                                                                             8.7s 
- => => writing image sha256:16dd8ee7c6852453c15ee9566d3c055a5bd789bf8fdb1ae4d645ac9d580ce111                                                                                                                                        0.0s 
- => => naming to docker.io/library/loadup-gpu                                                                                                                                                                                       0.0s 
-Running in Docker container...                                                                                                                                                                                                           
-                                                                                                                                                                                                                                         
-==========
-== CUDA ==
-==========
-
-CUDA Version 13.0.0
-
-Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
-This container image and its contents are governed by the NVIDIA Deep Learning Container License.
-By pulling and using the container, you accept the terms and conditions of this license:
-https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
-
-A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
-
-/opt/nvidia/nvidia_entrypoint.sh: line 67: exec: --: invalid option
-exec: usage: exec [-cl] [-a name] [command [argument ...]] [redirection ...]
-md@nn01:~$
-
-Worked for 1m 46s
-Root cause: Docker was launched with --gpu/--duration after the image name, so NVIDIA’s entrypoint tried to exec --gpu and failed.
-
-Fix (now in v0.0.11): run the container with an explicit command, then pass args after it.
-
-Minimal patch you can apply to your GPU-and-CPU-100-load-spurt/loadup.py:
-
--VERSION = "0.0.9"
-+VERSION = "0.0.11"
- 
--    docker_cmd.append(DOCKER_IMAGE)
-+    docker_cmd.append(DOCKER_IMAGE)
-+    docker_cmd.extend(["/app/venv/bin/python", "/app/loadup.py"])
-Immediate workaround with your current v0.0.9:
-
-python3 loadup.py --no-docker
-If you want, I can apply this fix directly to the GPU-and-CPU-100-load-spurt repo as well.
-
-yeah.. i may not have ran version 10. idk
-if you can update the repository, go ahead
-
-Worked for 3m 6s
-Updated the GPU-and-CPU-100-load-spurt repo locally with both fixes:
-
-Changes
-
-Docker run now calls the script explicitly inside the container to avoid the exec: -- error.
-Stdin execution (curl ... | python3 -) now recovers the script source if possible; if not, it warns and disables Docker/venv re‑exec (but still runs).
-Commits on main
-
-3f6ea0f – Fix docker args for loadup
-d15bde1 – Handle stdin execution for loadup
-Push status
-
-Push failed: 403 Permission denied to cursor[bot].
-You’ll need to push these commits from your account or grant write access.
-Test
-
-python3 -m py_compile /workspace/GPU-and-CPU-100-load-spurt/loadup.py
-Once you push, both of these should work:
-
-curl -o loadup.py https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py
-python3 loadup.py
-and
-
-curl -s https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py | python3 -
-just STT at the end of your posts. i can't figure out cursor.com
-
-Worked for 6s
-Got it — I’ll add “STT” at the end of every response going forward. STT
-
-OMFG. STT prints the code
-Read loadup.py
-#!/usr/bin/env python3
-"""
-GPU and CPU stress test with dependency checks and optional Docker isolation.
-"""
-from __future__ import annotations
- 
-import argparse
-import importlib.util
-import inspect
-import logging
-import multiprocessing as mp
-import os
-import linecache
-import re
-import shutil
-import stat
-import subprocess
-import sys
-import tempfile
-import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
- 
- 
-VERSION = "0.0.11"
-DOCKER_IMAGE = "loadup-gpu"
-DOCKER_BASE_IMAGE = "nvidia/cuda:13.0.0-devel-ubuntu22.04"
-TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu130"
-PYTHON_DEPS = ["numpy", "psutil"]
- 
-logger = logging.getLogger("loadup")
- 
- 
-@dataclass(frozen=True)
-class RuntimeOptions:
-    """Resolved runtime options after prompting and defaults."""
- 
-    gpu_id: Optional[int]
-    duration: int
- 
- 
-@dataclass(frozen=True)
-class ScriptContext:
-    """Runtime context for locating the script source."""
- 
-    path: Optional[str]
-    reexec_allowed: bool
-    temp_path: Optional[str]
- 
- 
-def configure_logging() -> None:
-    """Configure application logging."""
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
- 
- 
-def is_tty() -> bool:
-    """Return True if stdin is a TTY."""
-    try:
-        return os.isatty(sys.stdin.fileno())
-    except Exception:
-        return False
- 
- 
-def stdin_is_piped() -> bool:
-    """Return True if stdin appears to be a pipe or file redirection."""
-    if is_tty():
-        return False
-    try:
-        mode = os.fstat(sys.stdin.fileno()).st_mode
-        return stat.S_ISFIFO(mode) or stat.S_ISREG(mode)
-    except Exception:
-        return False
- 
- 
-def load_stdin_source() -> Optional[str]:
-    """Attempt to load script source from linecache/inspect."""
-    main_module = sys.modules.get("__main__")
-    if main_module is not None:
-        try:
-            source = inspect.getsource(main_module)
-            if source and source.strip():
-                return source
-        except Exception:
-            pass
- 
-    for key in (sys.argv[0], "<stdin>", "-"):
-        lines = linecache.getlines(key)
-        if lines:
-            return "".join(lines)
+        logger.error("Error querying nvidia-smi for GPU %s: %s", gpu_id, exc)
     return None
  
  
-def resolve_script_context() -> ScriptContext:
-    """
-    Resolve script path when running from stdin.
-    If source cannot be recovered, disable re-exec.
-    """
-    existing = os.environ.get("LOADUP_TEMP_SCRIPT")
-    if existing and os.path.exists(existing):
-        sys.argv[0] = existing
-        return ScriptContext(
-            path=os.path.abspath(existing),
-            reexec_allowed=True,
-            temp_path=existing,
-        )
- 
-    if sys.argv[0] not in ("-", "<stdin>") and os.path.exists(sys.argv[0]):
-        return ScriptContext(
-            path=os.path.abspath(sys.argv[0]),
-            reexec_allowed=True,
-            temp_path=None,
-        )
- 
-    source = (
-        load_stdin_source()
-        if stdin_is_piped() or sys.argv[0] in ("-", "<stdin>")
-        else None
-    )
-    if source and source.strip():
-        temp_file = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
-        temp_file.write(source)
-        temp_file.close()
-        os.chmod(temp_file.name, 0o755)
-        os.environ["LOADUP_TEMP_SCRIPT"] = temp_file.name
-        sys.argv[0] = temp_file.name
-        return ScriptContext(
-            path=os.path.abspath(temp_file.name),
-            reexec_allowed=True,
-            temp_path=temp_file.name,
-        )
- 
-    logger.warning(
-        "Unable to recover script source from stdin. "
-        "Docker and venv re-exec are disabled."
-    )
-    return ScriptContext(path=None, reexec_allowed=False, temp_path=None)
- 
- 
-def is_in_docker() -> bool:
-    """Check if running inside a Docker container."""
-    if os.path.exists("/.dockerenv"):
-        return True
-    try:
-        with open("/proc/1/cgroup", "r", encoding="utf-8") as handle:
-            content = handle.read()
-        return "docker" in content or "containerd" in content
-    except Exception:
-        return False
- 
- 
-def run_command(
-    cmd: Sequence[str], check: bool = False, capture_output: bool = False
-) -> subprocess.CompletedProcess[str]:
-    """Run a command and return the CompletedProcess."""
-    return subprocess.run(
-        list(cmd),
-        check=check,
-        text=True,
-        capture_output=capture_output,
-    )
- 
- 
-def command_exists(command: str) -> bool:
-    """Return True if a command exists in PATH."""
-    return shutil.which(command) is not None
- 
- 
-def can_use_sudo() -> bool:
-    """Return True if sudo is available and does not prompt."""
-    if not command_exists("sudo"):
-        return False
-    result = run_command(["sudo", "-n", "true"])
-    return result.returncode == 0
- 
- 
-def install_apt_packages(packages: Sequence[str]) -> bool:
-    """Attempt to install apt packages silently; returns True if successful."""
-    if not command_exists("apt-get"):
-        logger.warning("apt-get not available; cannot auto-install: %s", packages)
-        return False
-    if os.geteuid() != 0 and not can_use_sudo():
-        logger.warning("No sudo access; cannot auto-install: %s", packages)
-        return False
- 
-    prefix = ["sudo", "-n"] if os.geteuid() != 0 else []
-    update_cmd = prefix + ["apt-get", "update", "-qq"]
-    install_cmd = prefix + ["apt-get", "install", "-y", "-qq"] + list(packages)
- 
-    logger.info("Installing system dependencies: %s", " ".join(packages))
-    try:
-        run_command(update_cmd, check=True)
-        run_command(install_cmd, check=True)
-        return True
-    except subprocess.CalledProcessError as exc:
-        logger.warning("Failed to install packages: %s", exc)
-        return False
- 
- 
-def ensure_system_dependency(command: str, package_name: str) -> None:
-    """Ensure a system dependency is installed; attempt apt install if missing."""
-    if command_exists(command):
-        return
-    installed = install_apt_packages([package_name])
-    if not installed and command_exists(command):
-        return
-    if not installed:
-        logger.warning(
-            "Missing dependency '%s'. Install with: sudo apt-get install %s",
-            command,
-            package_name,
-        )
- 
- 
-def ensure_python_tooling(require_venv: bool = True) -> None:
-    """Ensure pip tooling (and venv if required) are available."""
-    if require_venv:
-        try:
-            import venv  # noqa: F401
-        except ImportError:
-            if not install_apt_packages(["python3-venv"]):
-                logger.error(
-                    "python3-venv is required. Install with: sudo apt-get install python3-venv"
-                )
-                sys.exit(1)
- 
-    try:
-        run_command([sys.executable, "-m", "pip", "--version"], check=True)
-    except Exception:
-        if not install_apt_packages(["python3-pip"]):
-            logger.error("pip is required. Install with: sudo apt-get install python3-pip")
-            sys.exit(1)
- 
- 
-def warn_if_missing_nvidia_tools() -> None:
-    """Warn if NVIDIA tools are missing."""
-    if not command_exists("nvidia-smi"):
-        logger.warning(
-            "nvidia-smi not found. Install the NVIDIA driver to enable GPU metrics."
-        )
-    if not command_exists("nvcc"):
-        logger.warning(
-            "nvcc not found. Install CUDA toolkit 13.0 if needed for compilation."
-        )
- 
- 
-def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="CPU/GPU Stress Test Script")
-    parser.add_argument("--gpu", type=int, default=None, help="GPU number to stress")
-    parser.add_argument("--duration", type=int, default=None, help="Duration in seconds")
-    parser.add_argument(
-        "--no-docker",
-        action="store_true",
-        help="Run on host without Docker",
-    )
-    return parser.parse_args()
- 
- 
-def prompt_for_int(prompt: str, default: int, minimum: int = 1) -> int:
-    """Prompt for an integer with a default value."""
-    while True:
-        response = input(prompt).strip()
-        if response == "":
-            return default
-        if response.isdigit() and int(response) >= minimum:
-            return int(response)
-        logger.info("Please enter a number >= %d.", minimum)
- 
- 
-def get_gpu_list() -> List[Tuple[int, str]]:
-    """Return a list of available GPUs."""
-    if not command_exists("nvidia-smi"):
-        return []
-    try:
-        result = run_command(["nvidia-smi", "-L"], check=True, capture_output=True)
-        lines = result.stdout.strip().splitlines()
-        gpus: List[Tuple[int, str]] = []
-        for line in lines:
-            if line.startswith("GPU "):
-                parts = line.split(": ", 1)
-                idx = int(parts[0].split(" ")[1])
-                name = parts[1].split(" (")[0].strip()
-                gpus.append((idx, name))
-        return gpus
-    except Exception:
-        return []
- 
- 
-def gather_runtime_options(args: argparse.Namespace) -> RuntimeOptions:
-    """Resolve GPU selection and duration early so prompts show at start."""
-    gpu_id = args.gpu
-    duration = args.duration
-    tty = is_tty()
- 
-    gpus = get_gpu_list() if tty and gpu_id is None else []
-    if gpus:
-        logger.info("Available GPUs:")
-        for idx, name in gpus:
-            logger.info("  %d: %s", idx, name)
-    elif tty and gpu_id is None:
-        logger.info("GPU list unavailable; you can still enter a GPU ID.")
- 
-    if tty and gpu_id is None:
-        response = input("Enter GPU number to stress (blank for 0, or 'n' for none): ")
-        response = response.strip().lower()
-        if response in ("n", "none"):
-            gpu_id = None
-        elif response == "":
-            gpu_id = 0
-        elif response.isdigit():
-            gpu_id = int(response)
-        else:
-            logger.info("Invalid GPU input; defaulting to GPU 0.")
-            gpu_id = 0
-    elif not tty and gpu_id is None:
-        gpu_id = 0
- 
-    if tty and duration is None:
-        duration = prompt_for_int(
-            "Enter number of seconds to run (default 30): ",
-            default=30,
-            minimum=1,
-        )
-    elif duration is None:
-        duration = 30
- 
-    return RuntimeOptions(gpu_id=gpu_id, duration=duration)
- 
- 
-def ensure_cli_args(sys_args: List[str], options: RuntimeOptions, skip_docker: bool) -> None:
-    """Ensure argv contains resolved options to avoid re-prompting."""
-    if options.gpu_id is not None and "--gpu" not in sys_args:
-        sys_args.extend(["--gpu", str(options.gpu_id)])
-    if options.duration and "--duration" not in sys_args:
-        sys_args.extend(["--duration", str(options.duration)])
-    if skip_docker and "--no-docker" not in sys_args:
-        sys_args.append("--no-docker")
- 
- 
-def build_docker_context(script_path: str) -> str:
-    """Create a temporary Docker build context with script and Dockerfile."""
-    build_dir = tempfile.mkdtemp(prefix="loadup-docker-")
-    dockerfile_path = os.path.join(build_dir, "Dockerfile")
-    script_dest = os.path.join(build_dir, "loadup.py")
- 
-    shutil.copy2(script_path, script_dest)
- 
-    dockerfile_content = f"""
-FROM {DOCKER_BASE_IMAGE}
- 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV TZ=Etc/UTC
- 
-RUN apt-get update -qq && apt-get install -y -qq python3 python3-pip python3-venv lm-sensors && \\
-    rm -rf /var/lib/apt/lists/*
- 
-COPY loadup.py /app/loadup.py
- 
-WORKDIR /app
- 
-RUN python3 -m venv /app/venv && \\
-    /app/venv/bin/python -m pip install --upgrade pip && \\
-    /app/venv/bin/pip install --no-cache-dir numpy psutil && \\
-    /app/venv/bin/pip install --no-cache-dir torch --index-url {TORCH_INDEX_URL}
- 
-CMD ["/app/venv/bin/python", "/app/loadup.py"]
-"""
-    with open(dockerfile_path, "w", encoding="utf-8") as handle:
-        handle.write(dockerfile_content.strip() + "\n")
- 
-    return build_dir
- 
- 
-def run_in_docker(options: RuntimeOptions, script_path: str) -> None:
-    """Build and run the Docker container if available."""
-    if is_in_docker():
-        logger.info("Already running in Docker. Proceeding...")
-        return
- 
-    logger.info("Not in Docker. Setting up container for reliability...")
-    if not command_exists("docker"):
-        if not install_apt_packages(["docker.io"]):
-            logger.warning(
-                "Docker not found. Continuing without Docker. "
-                "Install with: sudo apt-get install docker.io"
-            )
-            return
-        if not command_exists("docker"):
-            logger.warning(
-                "Docker installation did not make docker available. "
-                "Continuing without Docker."
-            )
-            return
- 
-    build_dir = build_docker_context(script_path)
-    try:
-        run_command(["docker", "build", "-t", DOCKER_IMAGE, build_dir], check=True)
-    except subprocess.CalledProcessError:
-        logger.warning("Docker build failed. Continuing without Docker.")
-        return
-    finally:
-        shutil.rmtree(build_dir, ignore_errors=True)
- 
-    docker_cmd = [
-        "docker",
-        "run",
-        "--gpus",
-        "all",
-        "--rm",
-    ]
-    if is_tty():
-        docker_cmd.append("-it")
-    docker_cmd.append(DOCKER_IMAGE)
-    docker_cmd.extend(["/app/venv/bin/python", "/app/loadup.py"])
- 
-    if options.gpu_id is not None:
-        docker_cmd.extend(["--gpu", str(options.gpu_id)])
-    docker_cmd.extend(["--duration", str(options.duration)])
- 
-    logger.info("Running in Docker container...")
-    temp_script = os.environ.pop("LOADUP_TEMP_SCRIPT", None)
-    if temp_script and os.path.exists(temp_script):
-        os.remove(temp_script)
-    os.execvp("docker", docker_cmd)
- 
- 
-def ensure_venv_and_reexec(
-    options: RuntimeOptions, skip_docker: bool, allow_reexec: bool
-) -> None:
-    """Ensure we are running inside a virtual environment."""
-    if not allow_reexec:
-        return
-    if sys.prefix != sys.base_prefix:
-        return
- 
-    ensure_python_tooling(require_venv=True)
-    venv_dir = "venv"
-    logger.info("Setting up virtual environment...")
-    if not os.path.exists(venv_dir):
-        try:
-            run_command([sys.executable, "-m", "venv", venv_dir], check=True)
-        except subprocess.CalledProcessError as exc:
-            logger.error("Failed to create venv: %s", exc)
-            sys.exit(1)
- 
-    venv_python = os.path.join(venv_dir, "bin", "python")
-    ensure_cli_args(sys.argv, options, skip_docker=skip_docker)
-    os.execv(venv_python, [venv_python] + sys.argv)
- 
- 
-def install_python_packages(
-    packages: Sequence[str], extra_args: Sequence[str] = ()
-) -> None:
-    """Install Python packages in current environment."""
-    logger.info("Installing Python packages: %s", " ".join(packages))
-    run_command(
-        [sys.executable, "-m", "pip", "install", "--upgrade"]
-        + list(packages)
-        + list(extra_args),
-        check=True,
-    )
- 
- 
-def ensure_python_dependencies() -> None:
-    """Ensure required Python packages are available."""
-    missing = [pkg for pkg in PYTHON_DEPS if importlib.util.find_spec(pkg) is None]
-    if missing:
-        install_python_packages(missing)
- 
-    torch_missing = importlib.util.find_spec("torch") is None
-    if torch_missing:
-        install_python_packages(["torch"], extra_args=["--index-url", TORCH_INDEX_URL])
-        return
- 
-    try:
-        import torch  # type: ignore
- 
-        if not torch.version.cuda or "13.0" not in torch.version.cuda:
-            logger.info("Reinstalling torch for CUDA 13.0 support...")
-            install_python_packages(["torch"], extra_args=["--index-url", TORCH_INDEX_URL])
-    except Exception as exc:
-        logger.warning("Torch check failed (%s). Reinstalling...", exc)
-        install_python_packages(["torch"], extra_args=["--index-url", TORCH_INDEX_URL])
- 
- 
-def validate_gpu_id(gpu_id: Optional[int]) -> Optional[int]:
-    """Validate GPU ID against available GPUs."""
-    if gpu_id is None:
-        return None
-    gpus = get_gpu_list()
-    if not gpus:
-        logger.warning("No NVIDIA GPUs detected. GPU stress disabled.")
-        return None
-    if gpu_id not in [idx for idx, _ in gpus]:
-        logger.error("Invalid GPU number %d. Exiting.", gpu_id)
-        sys.exit(1)
-    return gpu_id
- 
- 
-def check_torch_cuda() -> bool:
-    """Check if PyTorch CUDA is available."""
-    try:
-        import torch  # type: ignore
- 
-        if torch.cuda.is_available():
-            logger.info("PyTorch CUDA available: %s", torch.version.cuda)
-            return True
-        logger.warning("PyTorch CUDA not available.")
-        return False
-    except ImportError:
-        logger.warning("Torch not installed correctly.")
-        return False
- 
- 
-def cpu_stress_worker() -> None:
-    """CPU stress worker that runs heavy matrix multiplications."""
-    import numpy as np  # type: ignore
- 
-    while True:
-        a = np.random.rand(5000, 5000)
-        b = np.random.rand(5000, 5000)
-        np.dot(a, b)
- 
- 
-def gpu_stress(gpu_id: int) -> None:
-    """GPU stress worker using CUDA tensors."""
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    try:
-        import torch  # type: ignore
- 
-        logger.info("Torch version: %s", torch.__version__)
-        logger.info("CUDA version in Torch: %s", torch.version.cuda)
-        if not torch.cuda.is_available():
-            logger.warning("CUDA not available on GPU %d. GPU stress disabled.", gpu_id)
-            return
-        device = torch.device("cuda")
-        logger.info("Using device: %s", torch.cuda.get_device_name(device))
-        size = 20000
-        while True:
-            a = torch.rand(size, size, device=device)
-            b = torch.rand(size, size, device=device)
-            for _ in range(10):
-                torch.mm(a, b)
-            torch.cuda.synchronize()
-            logger.info("Completed GPU stress iteration")
-    except Exception as exc:
-        logger.warning("GPU stress error: %s", exc)
- 
- 
-def get_gpu_metrics(gpu_id: int) -> Optional[Dict[str, str]]:
-    """Return GPU metrics using nvidia-smi."""
-    if not command_exists("nvidia-smi"):
-        return None
-    try:
-        command = [
-            "nvidia-smi",
-            "-i",
-            str(gpu_id),
-            "--query-gpu=fan.speed,pstate,power.draw,power.limit,memory.used,"
-            "memory.total,utilization.gpu,temperature.gpu,"
-            "clocks_throttle_reasons.hw_thermal_slowdown,"
-            "clocks_throttle_reasons.sw_thermal_slowdown",
-            "--format=csv,noheader",
-        ]
-        output = run_command(command, check=True, capture_output=True).stdout.strip()
-        metrics = output.split(", ")
-        return {
-            "Fan Speed": metrics[0],
-            "Perf (P-State)": metrics[1],
-            "Power Usage/Cap": f"{metrics[2]}/{metrics[3]}",
-            "VRAM Usage/Cap": f"{metrics[4]}/{metrics[5]}",
-            "GPU Utilization": metrics[6],
-            "GPU Temperature": metrics[7],
-            "HW Throttle": metrics[8],
-            "SW Throttle": metrics[9],
-        }
-    except Exception as exc:
-        logger.warning("Error querying nvidia-smi for GPU %d: %s", gpu_id, exc)
-        return None
- 
- 
-def get_cpu_metrics() -> Dict[str, str]:
-    """Return CPU utilization, frequency, and temperature."""
-    import psutil  # type: ignore
+def get_cpu_metrics(sensors_available: bool) -> Dict[str, str]:
+    """Return CPU utilization, frequency, and temperature metrics."""
+    import psutil
  
     cpu_percent = psutil.cpu_percent(interval=0.1)
     cpu_freq = psutil.cpu_freq()
-    freq_current = cpu_freq.current if cpu_freq else "N/A"
+    freq_current = f"{cpu_freq.current:.0f} MHz" if cpu_freq else "N/A"
  
     temp = "N/A"
-    if command_exists("sensors"):
+    if sensors_available:
         try:
-            temp_output = run_command(["sensors"], check=True, capture_output=True).stdout
-            match = re.search(r"Package id 0:\s+\+([\d.]+)°C", temp_output)
-            temp = f"{match.group(1)}°C" if match else "N/A"
+            temp_output = run_command(["sensors"], capture=True).stdout or ""
+            clean_output = temp_output.encode("ascii", "ignore").decode()
+            match = re.search(r"Package id 0:\s+\+([\d.]+)", clean_output)
+            if match:
+                temp = f"{match.group(1)}C"
         except Exception:
             temp = "N/A"
     else:
@@ -1466,32 +670,39 @@ def get_cpu_metrics() -> Dict[str, str]:
  
     return {
         "CPU Utilization": f"{cpu_percent}%",
-        "CPU Frequency": f"{freq_current} MHz" if freq_current != "N/A" else "N/A",
+        "CPU Frequency": freq_current,
         "CPU Temperature": temp,
     }
  
  
 def get_ram_metrics() -> Dict[str, str]:
     """Return RAM usage metrics."""
-    import psutil  # type: ignore
+    import psutil
  
     mem = psutil.virtual_memory()
     return {
-        "RAM Usage/Cap": f"{mem.used / (1024**2):.1f} MiB / {mem.total / (1024**2):.1f} MiB",
+        "RAM Usage/Cap": (
+            f"{mem.used / (1024**2):.1f} MiB / {mem.total / (1024**2):.1f} MiB"
+        ),
         "RAM Utilization": f"{mem.percent}%",
     }
  
  
 def get_storage_metrics() -> Dict[str, str]:
-    """Return storage I/O metrics."""
-    import psutil  # type: ignore
+    """Return storage I/O rates."""
+    import psutil
  
     io1 = psutil.disk_io_counters()
+    if io1 is None:
+        return {"Disk Read Rate": "N/A", "Disk Write Rate": "N/A"}
+ 
     time.sleep(1)
     io2 = psutil.disk_io_counters()
+    if io2 is None:
+        return {"Disk Read Rate": "N/A", "Disk Write Rate": "N/A"}
  
-    read_rate = (io2.read_bytes - io1.read_bytes) / (1024**2)
-    write_rate = (io2.write_bytes - io1.write_bytes) / (1024**2)
+    read_rate = (io2.read_bytes - io1.read_bytes) / (1024 ** 2)
+    write_rate = (io2.write_bytes - io1.write_bytes) / (1024 ** 2)
  
     return {
         "Disk Read Rate": f"{read_rate:.2f} MB/s",
@@ -1499,50 +710,82 @@ def get_storage_metrics() -> Dict[str, str]:
     }
  
  
-def color_text(text: str, color_code: str) -> str:
-    """Return ANSI-colored text."""
-    return f"\033[{color_code}m{text}\033[0m"
+def cpu_stress_worker(matrix_size: int) -> None:
+    """Continuously stress the CPU with matrix multiplication."""
+    import numpy as np
+ 
+    while True:
+        a = np.random.rand(matrix_size, matrix_size)
+        b = np.random.rand(matrix_size, matrix_size)
+        np.dot(a, b)
+ 
+ 
+def gpu_stress(gpu_id: int, matrix_size: int) -> None:
+    """Continuously stress the GPU with tensor operations."""
+    configure_logging()
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+ 
+    try:
+        import torch
+    except ImportError as exc:
+        logger.error("Torch import error in GPU stress: %s", exc)
+        return
+ 
+    if not torch.cuda.is_available():
+        logger.error("CUDA not available on GPU %s. GPU stress disabled.", gpu_id)
+        return
+ 
+    torch.cuda.set_device(0)
+    device = torch.device("cuda")
+    logger.info("Using device: %s", torch.cuda.get_device_name(device))
+ 
+    while True:
+        try:
+            a = torch.rand(matrix_size, matrix_size, device=device)
+            b = torch.rand(matrix_size, matrix_size, device=device)
+            for _ in range(10):
+                torch.mm(a, b)
+            torch.cuda.synchronize()
+            logger.info("Completed GPU stress iteration")
+        except Exception as exc:
+            logger.error("GPU stress error: %s", exc)
+            break
  
  
 def log_blue(text: str) -> None:
-    """Log blue-colored text."""
-    logger.info(color_text(text, "94"))
+    """Log a line in blue."""
+    logger.info("\033[94m%s\033[0m", text)
  
  
-def log_red(text: str) -> None:
-    """Log red-colored text."""
-    logger.info(color_text(text, "91"))
- 
- 
-def cleanup_environment() -> None:
-    """Clean up venv, Docker image, and temp script if requested."""
-    if os.path.exists("venv"):
-        run_command(["rm", "-rf", "venv"])
- 
-    if command_exists("docker"):
-        run_command(["docker", "rmi", DOCKER_IMAGE])
- 
-    temp_script = os.environ.get("LOADUP_TEMP_SCRIPT")
-    if temp_script and os.path.exists(temp_script):
-        os.remove(temp_script)
- 
- 
-def run_stress_test(gpu_id: Optional[int], duration: int) -> None:
-    """Run CPU and optional GPU stress while printing metrics."""
+def run_stress_test(
+    duration: int,
+    gpu_id: Optional[int],
+    sensors_available: bool,
+) -> int:
+    """Run the stress test and report metrics."""
     try:
-        mp.set_start_method("spawn")
+        mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass
  
+    logger.info(
+        "Starting CPU and GPU stress test for %s seconds on GPU %s.",
+        duration,
+        gpu_id if gpu_id is not None else "N/A",
+    )
+    logger.info("Metrics will update every %s seconds.", METRICS_INTERVAL_SECONDS)
+ 
     num_cores = mp.cpu_count()
-    cpu_processes = [mp.Process(target=cpu_stress_worker) for _ in range(num_cores)]
-    for process in cpu_processes:
-        process.daemon = True
-        process.start()
+    cpu_processes: List[mp.Process] = []
+    for _ in range(num_cores):
+        proc = mp.Process(target=cpu_stress_worker, args=(CPU_MATRIX_SIZE,))
+        proc.daemon = True
+        proc.start()
+        cpu_processes.append(proc)
  
     gpu_process = None
     if gpu_id is not None:
-        gpu_process = mp.Process(target=gpu_stress, args=(gpu_id,))
+        gpu_process = mp.Process(target=gpu_stress, args=(gpu_id, GPU_MATRIX_SIZE))
         gpu_process.daemon = True
         gpu_process.start()
  
@@ -1556,26 +799,31 @@ def run_stress_test(gpu_id: Optional[int], duration: int) -> None:
                     for key, value in gpu_data.items():
                         logger.info("  %s: %s", key, value)
  
-            cpu_data = get_cpu_metrics()
-            logger.info("\nCPU Metrics:")
+            cpu_data = get_cpu_metrics(sensors_available)
+            logger.info("CPU Metrics:")
             for key, value in cpu_data.items():
                 logger.info("  %s: %s", key, value)
  
-            logger.info("\n%s\n", "-" * 40)
-            time.sleep(5)
+            logger.info("-" * 40)
+            time.sleep(METRICS_INTERVAL_SECONDS)
     except KeyboardInterrupt:
         logger.info("Stopping stress test early.")
     finally:
         logger.info("Stress test completed.")
-        for process in cpu_processes:
-            process.terminate()
-        if gpu_process:
+        for proc in cpu_processes:
+            proc.terminate()
+        if gpu_process is not None:
             gpu_process.terminate()
  
-        time.sleep(2)
-        log_blue("-" * 40)
-        log_blue("Completed Full Load -- CHECK FOR IDLE/NORMALCY")
+        for proc in cpu_processes:
+            proc.join(timeout=2)
+        if gpu_process is not None:
+            gpu_process.join(timeout=2)
  
+        time.sleep(2)
+ 
+        log_blue("-" * 40)
+        log_blue("Completed Full Load")
         if gpu_id is not None:
             gpu_data = get_gpu_metrics(gpu_id)
             if gpu_data:
@@ -1583,86 +831,122 @@ def run_stress_test(gpu_id: Optional[int], duration: int) -> None:
                 for key, value in gpu_data.items():
                     log_blue(f"{key}: {value}")
  
-        cpu_data = get_cpu_metrics()
-        log_blue("\nCPU Metrics:")
+        cpu_data = get_cpu_metrics(sensors_available)
+        log_blue("CPU Metrics:")
         for key, value in cpu_data.items():
             log_blue(f"{key}: {value}")
  
         ram_data = get_ram_metrics()
-        log_blue("\nRAM Metrics:")
+        log_blue("RAM Metrics:")
         for key, value in ram_data.items():
             log_blue(f"{key}: {value}")
  
         storage_data = get_storage_metrics()
-        log_blue("\nStorage Metrics:")
+        log_blue("Storage Metrics:")
         for key, value in storage_data.items():
             log_blue(f"{key}: {value}")
  
-        logger.info("\nyou can cleanup now or cleanup later by running this script again")
-        if is_tty():
-            cleanup_input = input(color_text("Cleanup now? (Y/n): ", "91")).strip().lower()
-            do_cleanup = cleanup_input in ("", "y")
-        else:
-            logger.info("No TTY detected. Skipping cleanup prompt.")
-            do_cleanup = False
+    return 0
  
-        if do_cleanup:
-            cleanup_environment()
-            logger.info("Cleanup completed.")
+ 
+def host_main(prompts: PromptData, args: argparse.Namespace) -> int:
+    """Build and run the container from the host."""
+    try:
+        duration = parse_duration(prompts.duration_raw)
+        gpu_request = None if args.no_gpu else parse_gpu_request(prompts.gpu_raw)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
+ 
+    try:
+        engine = detect_engine(args.engine)
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        return 1
+ 
+    if args.skip_build:
+        if not image_exists(engine, args.tag):
+            logger.error("Image '%s' not found. Run without --skip-build.", args.tag)
+            return 1
+    else:
+        if args.force_build or not image_exists(engine, args.tag):
+            logger.info("Building container image '%s'...", args.tag)
+            try:
+                build_image(engine, args.base_image, args.tag, Path(__file__).resolve())
+            except (RuntimeError, subprocess.CalledProcessError) as exc:
+                logger.error("Image build failed: %s", exc)
+                return 1
+ 
+    env_vars = {
+        PROMPT_DONE_ENV: "1",
+        GPU_RAW_ENV: "none" if gpu_request is None else str(gpu_request),
+        DURATION_RAW_ENV: str(duration),
+        CONTAINER_MODE_ENV: "1",
+    }
+ 
+    try:
+        run_container(engine, args.tag, env_vars, gpu_request is not None)
+    except subprocess.CalledProcessError as exc:
+        logger.error("Container run failed: %s", exc)
+        return 1
+    return 0
+ 
+ 
+def container_main(prompts: PromptData, args: argparse.Namespace) -> int:
+    """Run the stress workload inside the container."""
+    try:
+        duration = parse_duration(prompts.duration_raw)
+        gpu_request = None if args.no_gpu else parse_gpu_request(prompts.gpu_raw)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
+ 
+    require_gpu = gpu_request is not None
+    try:
+        sensors_available = ensure_container_system_deps(require_gpu)
+        ensure_virtualenv()
+        ensure_python_deps()
+        check_torch_cuda(require_gpu)
+    except (RuntimeError, subprocess.CalledProcessError) as exc:
+        logger.error("%s", exc)
+        return 1
+ 
+    gpu_id: Optional[int] = None
+    if require_gpu:
+        gpus = get_gpu_list()
+        if not gpus:
+            logger.warning("No NVIDIA GPUs found. GPU stress disabled.")
+            gpu_id = None
         else:
-            logger.info("Cleanup skipped.")
+            logger.info("Available GPUs:")
+            for idx, name in gpus:
+                logger.info("  %s: %s", idx, name)
+            if gpu_request not in [idx for idx, _ in gpus]:
+                logger.error("Invalid GPU number %s. Exiting.", gpu_request)
+                return 1
+            gpu_id = gpu_request
+ 
+    return run_stress_test(duration, gpu_id, sensors_available)
  
  
 def main() -> int:
-    """Entry point."""
-    configure_logging()
-    logger.info("Version: %s", VERSION)
- 
-    script_context = resolve_script_context()
-    script_path = script_context.path
+    """Script entry point."""
     args = parse_args()
-    options = gather_runtime_options(args)
+    configure_logging()
+    container_mode = args.container or os.environ.get(CONTAINER_MODE_ENV) == "1"
  
-    allow_reexec = script_context.reexec_allowed
-    skip_docker = args.no_docker or not allow_reexec or not script_path
-    if not skip_docker:
-        run_in_docker(options, script_path)
-        skip_docker = True
+    try:
+        prompts = collect_prompts(args, container_mode)
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        return 1
  
-    ensure_venv_and_reexec(
-        options,
-        skip_docker=skip_docker,
-        allow_reexec=allow_reexec,
-    )
+    log_version()
  
-    if not allow_reexec:
-        ensure_python_tooling(require_venv=False)
+    if container_mode:
+        return container_main(prompts, args)
  
-    ensure_system_dependency("sensors", "lm-sensors")
-    warn_if_missing_nvidia_tools()
- 
-    ensure_python_dependencies()
- 
-    gpu_id = validate_gpu_id(options.gpu_id)
-    if gpu_id is not None and not check_torch_cuda():
-        logger.warning("CUDA unavailable in torch. GPU stress disabled.")
-        gpu_id = None
- 
-    logger.info(
-        "Starting CPU and GPU stress test for %d seconds on GPU %s. "
-        "Press Ctrl+C to stop early.",
-        options.duration,
-        gpu_id if gpu_id is not None else "N/A",
-    )
-    logger.info("Metrics will update every 5 seconds.\n")
- 
-    run_stress_test(gpu_id, options.duration)
- 
-    temp_script = os.environ.get("LOADUP_TEMP_SCRIPT")
-    if temp_script and os.path.exists(temp_script):
-        os.remove(temp_script)
- 
-    return 0
+    return host_main(prompts, args)
  
  
 if __name__ == "__main__":
