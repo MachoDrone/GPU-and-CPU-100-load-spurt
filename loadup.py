@@ -9,7 +9,7 @@ import platform
 import argparse
 import tempfile
 
-VERSION = "0.0.2"
+VERSION = "0.0.3"
 print(f"Version: {VERSION}")
 time.sleep(3)
 
@@ -72,13 +72,15 @@ CMD ["/app/venv/bin/python", "/app/loadup.py"]
         print("Docker build failed. Continuing without Docker...")
         return
     
-    # Run container with GPU access, interactive, and remove on exit
+    # Run container with GPU access, interactive if TTY, remove on exit
     print("Running in Docker container...")
     docker_cmd = [
-        "docker", "run", "--gpus", "all", "-it", "--rm",
+        "docker", "run", "--gpus", "all", "--rm",
         "-v", f"{os.getcwd()}:/app",  # Mount current dir if needed
         "loadup-gpu"
     ]
+    if os.isatty(sys.stdin.fileno()):
+        docker_cmd.insert(3, "-it")  # Add -it only if TTY available
     os.execvp("docker", docker_cmd)  # Replace current process with Docker run
 
 # Run Docker setup first
@@ -295,9 +297,12 @@ if __name__ == "__main__":
             print(f"{idx}: {name}")
         if args.gpu is not None:
             gpu_id = args.gpu
-        else:
+        elif os.isatty(sys.stdin.fileno()):
             gpu_input = input("Enter GPU number to stress (default 0): ").strip()
             gpu_id = int(gpu_input) if gpu_input else 0
+        else:
+            print("No TTY detected. Using default GPU 0.")
+            gpu_id = 0
         # Validate GPU ID
         if gpu_id not in [idx for idx, _ in gpus]:
             print(f"Invalid GPU number {gpu_id}. Exiting.")
@@ -306,9 +311,12 @@ if __name__ == "__main__":
     # Prompt for duration
     if args.duration is not None:
         duration = args.duration
-    else:
+    elif os.isatty(sys.stdin.fileno()):
         duration_input = input("Enter number of seconds to run (default 30): ").strip()
         duration = 30 if not duration_input else int(duration_input)
+    else:
+        print("No TTY detected. Using default duration 30 seconds.")
+        duration = 30
     
     print(f"Starting CPU and GPU stress test for {duration} seconds on GPU {gpu_id if gpu_id is not None else 'N/A'}. Press Ctrl+C to stop early.")
     print("Metrics will update every 5 seconds.\n")
@@ -383,8 +391,14 @@ if __name__ == "__main__":
         
         # Cleanup prompt
         print("\nyou can cleanup now or cleanup later by running this script again")
-        cleanup_input = input("\033[91mCleanup now? (Y/n): \033[0m").strip().lower()
-        if cleanup_input == '' or cleanup_input == 'y':
+        if os.isatty(sys.stdin.fileno()):
+            cleanup_input = input("\033[91mCleanup now? (Y/n): \033[0m").strip().lower()
+            do_cleanup = cleanup_input == '' or cleanup_input == 'y'
+        else:
+            print("No TTY detected. Skipping cleanup prompt (use Y/n interactively next time).")
+            do_cleanup = False
+        
+        if do_cleanup:
             # Cleanup venv and Dockerfile
             if os.path.exists('venv'):
                 subprocess.call(["rm", "-rf", "venv"])
