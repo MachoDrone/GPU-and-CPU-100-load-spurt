@@ -9,6 +9,10 @@ import platform
 import argparse
 import tempfile
 
+VERSION = "0.0.1"
+print(f"Version: {VERSION}")
+time.sleep(3)
+
 # Detect if script is being piped (e.g., curl | python3 -)
 is_piped = not os.isatty(sys.stdin.fileno())
 
