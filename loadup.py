@@ -9,7 +9,7 @@ import platform
 import argparse
 import tempfile
 
-VERSION = "0.0.5"
+VERSION = "0.0.6"
 print(f"Version: {VERSION}")
 time.sleep(3)
 
@@ -46,9 +46,12 @@ def setup_docker():
     
     # Generate Dockerfile in current dir
     dockerfile_content = """
-FROM nvidia/cuda:13.0.0-devel-ubuntu22.04
+FROM nvidia/cuda:13.0.0-base-ubuntu22.04
 
-RUN apt-get update && apt-get install -y python3 python3-pip python3-venv lm-sensors && \\
+RUN apt-get update && apt-get install -y software-properties-common && \\
+    add-apt-repository ppa:deadsnakes/ppa -y && apt-get update && \\
+    apt-get install -y python3.12 python3.12-venv python3.12-dev build-essential lm-sensors && \\
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \\
     rm -rf /var/lib/apt/lists/*
 
 COPY loadup.py /app/loadup.py
