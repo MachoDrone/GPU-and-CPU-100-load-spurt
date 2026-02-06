@@ -7,6 +7,18 @@ import os
 import re
 import platform
 import argparse
+import tempfile
+
+# Detect if script is being piped (e.g., curl | python3 -)
+is_piped = not os.isatty(sys.stdin.fileno())
+
+if is_piped:
+    # Save piped input to a temporary file to allow execv
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
+        temp_file.write(sys.stdin.read())
+        temp_script = temp_file.name
+    os.chmod(temp_script, 0o755)
+    sys.argv[0] = temp_script  # Update argv for execv
 
 def is_in_docker():
     """Check if running inside Docker container"""
@@ -381,5 +393,9 @@ if __name__ == "__main__":
             print("Cleanup completed.")
         else:
             print("Cleanup skipped.")
+        
+        # Clean up temp script if piped
+        if is_piped and 'temp_script' in globals():
+            os.remove(temp_script)
         
         sys.exit(0)
