@@ -21,7 +21,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 SCRIPT_URL = "https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py"
 
 # Parse command-line arguments FIRST (before any setup)
@@ -854,7 +854,6 @@ while True:
             total_peak += peak_cpu_watts
         else:
             print_blue("  CPU Peak: N/A (RAPL not available -- try running as root)")
-        print_blue(f"  RAM Power: N/A (not measurable via software)")
         if total_peak > 0:
             print_blue(f"  Total Measured Peak: {total_peak:.1f} W"
                        + (" (GPU only)" if peak_cpu_watts == 0 else " (GPU + CPU)"))
