@@ -7,7 +7,7 @@ import os
 import re
 import platform
 import argparse
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(description="CPU/GPU Stress Test Script")
@@ -208,6 +208,9 @@ def check_cuda_installed():
 # Virtual environment setup
 # ──────────────────────────────────────────────────────────
 
+# Track venv python binary for subprocess use (e.g., GPU stress in piped mode)
+_venv_python = sys.executable  # Default: current interpreter (correct if already in venv)
+
 # Check if running in a virtual environment
 if sys.prefix == sys.base_prefix:
     venv_dir = 'venv'
@@ -227,6 +230,7 @@ if sys.prefix == sys.base_prefix:
         # Piped mode: os.execv won't work because Python already consumed stdin
         # (the temp file would be empty). Activate venv inline instead.
         print("Activating virtual environment inline (piped mode)...")
+        _venv_python = os.path.abspath(venv_python)
         import site
         venv_lib = os.path.join(os.path.abspath(venv_dir), 'lib')
         # Find the pythonX.Y directory inside venv/lib/
@@ -384,19 +388,27 @@ def print_red(text):
 # ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Set multiprocessing start method to 'spawn' for CUDA compatibility
-    mp.set_start_method('spawn')
-
     # GPU and duration were already collected at the top of the script
     gpu_id = args.gpu if args.gpu is not None and args.gpu >= 0 else None
     duration = args.duration if args.duration is not None else 30
+
+    # Multiprocessing strategy depends on execution mode:
+    # - Piped mode (curl | python3 -): 'spawn' fails because __file__ is <stdin>,
+    #   and child processes can't re-import from '/home/user/<stdin>'.
+    #   Use 'fork' for CPU workers (numpy only, no CUDA), and subprocess for GPU.
+    # - File mode (python3 loadup.py): 'spawn' works normally for CUDA safety.
+    if is_piped:
+        cpu_ctx = mp.get_context('fork')
+    else:
+        mp.set_start_method('spawn')
+        cpu_ctx = mp.get_context('spawn')
 
     print(f"\nStarting CPU and GPU stress test for {duration} seconds on GPU {gpu_id if gpu_id is not None else 'N/A'}. Press Ctrl+C to stop early.")
     print("Metrics will update every 5 seconds.\n")
 
     # Start CPU stress processes (one per logical core)
     num_cores = mp.cpu_count()
-    cpu_processes = [mp.Process(target=cpu_stress_worker) for _ in range(num_cores)]
+    cpu_processes = [cpu_ctx.Process(target=cpu_stress_worker) for _ in range(num_cores)]
     for p in cpu_processes:
         p.daemon = True
         p.start()
@@ -404,9 +416,40 @@ if __name__ == "__main__":
     # Start GPU stress in a separate process if GPU available
     gpu_process = None
     if gpu_id is not None:
-        gpu_process = mp.Process(target=gpu_stress, args=(gpu_id,))
-        gpu_process.daemon = True
-        gpu_process.start()
+        if is_piped:
+            # Piped mode: use subprocess with venv python to avoid spawn __file__ issue
+            gpu_stress_code = f'''
+import os, sys, torch
+os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu_id}"
+print(f"Torch version: {{torch.__version__}}")
+print(f"CUDA version in Torch: {{torch.version.cuda}}")
+if not torch.cuda.is_available():
+    print("CUDA not available on GPU {gpu_id}. GPU stress disabled.")
+    sys.exit(1)
+device = torch.device("cuda")
+print(f"CUDA available on GPU {gpu_id}: True")
+print(f"Using device: {{torch.cuda.get_device_name(device)}}")
+size = 20000
+while True:
+    try:
+        a = torch.rand(size, size, device=device)
+        b = torch.rand(size, size, device=device)
+        for _ in range(10):
+            c = torch.mm(a, b)
+        torch.cuda.synchronize()
+        print("Completed GPU stress iteration")
+    except Exception as e:
+        print(f"GPU stress error: {{e}}")
+        break
+'''
+            gpu_process = subprocess.Popen(
+                [_venv_python, "-c", gpu_stress_code],
+                env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)}
+            )
+        else:
+            gpu_process = mp.Process(target=gpu_stress, args=(gpu_id,))
+            gpu_process.daemon = True
+            gpu_process.start()
 
     start_time = time.time()
     try:
