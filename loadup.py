@@ -21,7 +21,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 SCRIPT_URL = "https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py"
 
 # Parse command-line arguments FIRST (before any setup)
@@ -58,8 +58,10 @@ if args.docker is None and os.environ.get("DOCKER", "").strip().lower() in ("y",
     args.docker = os.environ["DOCKER"].strip().lower()
 
 print(f"\033[94mVersion: {VERSION}\033[0m")
-print("\033[91mDOCKER CONTAINER CREATION MAY HAVE LONG PAUSES -- THIS IS NORMAL\033[0m")
-time.sleep(3)
+# Show Docker warning only when Docker mode is requested and not already in a container
+if args.docker == 'y' and not (os.path.exists('/.dockerenv') or 'docker' in platform.uname().release.lower()):
+    print("\033[91mDOCKER CONTAINER CREATION MAY HAVE LONG PAUSES -- THIS IS NORMAL\033[0m")
+    time.sleep(3)
 
 # Detect if script is being piped (e.g., curl | python3 -)
 is_piped = not os.isatty(sys.stdin.fileno())
