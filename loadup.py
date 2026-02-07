@@ -21,7 +21,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.6.3"
+VERSION = "0.7.0"
 SCRIPT_URL = "https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py"
 
 # Parse command-line arguments FIRST (before any setup)
@@ -394,9 +394,6 @@ RUN python3 -m venv /app/venv && \\
     # Build docker run command -- pass all args EXCEPT --docker (bare metal inside container)
     print("Running stress test in Docker container...")
     docker_cmd = ["docker", "run", "--gpus", "all", "--rm"]
-    # Mount RAPL sysfs for CPU power monitoring inside container
-    if os.path.exists("/sys/class/powercap"):
-        docker_cmd.extend(["-v", "/sys/class/powercap:/sys/class/powercap:ro"])
     if os.isatty(sys.stdin.fileno()):
         docker_cmd.extend(["-it"])
     docker_cmd.extend([
@@ -407,7 +404,63 @@ RUN python3 -m venv /app/venv && \\
     if args.cleanup:
         docker_cmd.extend(["--cleanup", args.cleanup])
 
-    ret = subprocess.call(docker_cmd)
+    # Launch Docker container and monitor host-side power in parallel.
+    # Docker containers share the host CPU/kernel, so RAPL on the host
+    # accurately measures CPU power consumed by the containerized workload.
+    docker_proc = subprocess.Popen(docker_cmd)
+    host_peak_gpu = 0.0
+    host_peak_cpu = 0.0
+    rapl_path = "/sys/class/powercap/intel-rapl:0/energy_uj"
+    rapl_ok = os.path.exists(rapl_path)
+
+    while docker_proc.poll() is None:
+        # Read CPU power via RAPL on host (0.5s sample)
+        if rapl_ok:
+            try:
+                with open(rapl_path) as f:
+                    e1 = int(f.read().strip())
+                time.sleep(0.5)
+                if docker_proc.poll() is not None:
+                    break
+                with open(rapl_path) as f:
+                    e2 = int(f.read().strip())
+                cpu_w = (e2 - e1) / 500_000
+                if cpu_w > host_peak_cpu:
+                    host_peak_cpu = cpu_w
+            except Exception:
+                rapl_ok = False
+
+        # Read GPU power via nvidia-smi on host
+        try:
+            gpu_out = subprocess.check_output(
+                ["nvidia-smi", "-i", str(args.gpu),
+                 "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+                stderr=subprocess.DEVNULL).decode().strip()
+            gpu_w = float(gpu_out)
+            if gpu_w > host_peak_gpu:
+                host_peak_gpu = gpu_w
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+    ret = docker_proc.returncode
+
+    # Print host-side power summary (RAPL works here even though container can't read it)
+    BLUE = "\033[94m"
+    RESET = "\033[0m"
+    if host_peak_gpu > 0 or host_peak_cpu > 0:
+        print(f"{BLUE}Host-Side Peak Power (measured during Docker run):{RESET}")
+        if host_peak_gpu > 0:
+            print(f"{BLUE}  GPU Peak: {host_peak_gpu:.1f} W{RESET}")
+        if host_peak_cpu > 0:
+            print(f"{BLUE}  CPU Peak: {host_peak_cpu:.1f} W{RESET}")
+        else:
+            print(f"{BLUE}  CPU Peak: N/A (RAPL not available){RESET}")
+        total = host_peak_gpu + host_peak_cpu
+        if total > 0:
+            label = "GPU + CPU" if host_peak_cpu > 0 else "GPU only"
+            print(f"{BLUE}  Total Measured Peak: {total:.1f} W ({label}){RESET}")
 
     # Cleanup Docker artifacts on host
     if args.cleanup == 'y':
@@ -417,7 +470,7 @@ RUN python3 -m venv /app/venv && \\
             os.remove(script_path)
         subprocess.call(["docker", "rmi", "loadup-gpu"],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print("\033[94mDocker artifacts cleaned up.\033[0m")
+        print(f"{BLUE}Docker artifacts cleaned up.{RESET}")
 
     sys.exit(ret)
 
