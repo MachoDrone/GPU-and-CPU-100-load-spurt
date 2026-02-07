@@ -1,5 +1,5 @@
 # I use this script to test peak wattages on PC builds.
-
+```
 !/usr/bin/env python3
  ──────────────────────────────────────────────────────────
  Usage:
