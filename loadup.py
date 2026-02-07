@@ -8,7 +8,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(
@@ -77,43 +77,41 @@ def get_gpu_list():
         print(f"Error listing GPUs: {e}")
         return []
 
-# Only prompt if values weren't already provided via CLI args or env vars
-# (CLI args are also set when re-executing through venv/Docker)
-if args.gpu is None or args.duration is None:
-    gpus = get_gpu_list()
-    if not gpus:
-        print("No NVIDIA GPUs found. GPU stress will be disabled.")
-        if args.gpu is None:
-            args.gpu = -1  # Sentinel: no GPU available
-    else:
-        print("Available GPUs:")
-        for idx, name in gpus:
-            print(f"  {idx}: {name}")
+# Resolve GPU selection: CLI/env > interactive prompt > default
+gpus = get_gpu_list()
+if not gpus:
+    print("No NVIDIA GPUs found. GPU stress will be disabled.")
+    args.gpu = -1  # Sentinel: no GPU available
+else:
+    print("Available GPUs:")
+    for idx, name in gpus:
+        print(f"  {idx}: {name}")
 
-        if args.gpu is None:
-            if os.isatty(sys.stdin.fileno()):
-                gpu_input = input("Enter GPU number to stress (default 0): ").strip()
-                args.gpu = int(gpu_input) if gpu_input else 0
-            else:
-                args.gpu = 0
-                print(f"Using default GPU {args.gpu}.")
-        else:
-            print(f"Using GPU {args.gpu} (from {'--gpu' if '--gpu' in sys.argv else 'GPU env var'}).")
-
-        # Validate GPU ID
-        if args.gpu not in [idx for idx, _ in gpus]:
-            print(f"Invalid GPU number {args.gpu}. Exiting.")
-            sys.exit(1)
-
-    if args.duration is None:
+    if args.gpu is None:
         if os.isatty(sys.stdin.fileno()):
-            duration_input = input("Enter number of seconds to run (default 30): ").strip()
-            args.duration = 30 if not duration_input else int(duration_input)
+            gpu_input = input("Enter GPU number to stress (default 0): ").strip()
+            args.gpu = int(gpu_input) if gpu_input else 0
         else:
-            args.duration = 30
-            print(f"Using default duration {args.duration} seconds.")
+            args.gpu = 0
+            print(f"Using default GPU {args.gpu}.")
     else:
-        print(f"Using duration {args.duration}s (from {'--duration' if '--duration' in sys.argv else 'DURATION env var'}).")
+        print(f"Using GPU {args.gpu} (from {'--gpu' if '--gpu' in sys.argv else 'GPU env var'}).")
+
+    # Always validate GPU ID
+    if args.gpu not in [idx for idx, _ in gpus]:
+        print(f"Invalid GPU number {args.gpu}. Available: {[idx for idx, _ in gpus]}. Exiting.")
+        sys.exit(1)
+
+# Resolve duration: CLI/env > interactive prompt > default
+if args.duration is None:
+    if os.isatty(sys.stdin.fileno()):
+        duration_input = input("Enter number of seconds to run (default 30): ").strip()
+        args.duration = 30 if not duration_input else int(duration_input)
+    else:
+        args.duration = 30
+        print(f"Using default duration {args.duration} seconds.")
+else:
+    print(f"Using duration {args.duration}s (from {'--duration' if '--duration' in sys.argv else 'DURATION env var'}).")
 
 # Inject --gpu, --duration, --cleanup into sys.argv so they carry through os.execv
 def ensure_args_in_argv():
@@ -136,8 +134,6 @@ def ensure_args_in_argv():
 
 ensure_args_in_argv()
 
-time.sleep(3)
-
 # ──────────────────────────────────────────────────────────
 # Docker detection and setup
 # ──────────────────────────────────────────────────────────
@@ -153,8 +149,7 @@ def setup_docker():
         return
 
     if is_piped:
-        print("Piped execution detected. Skipping Docker setup.")
-        return
+        return  # Docker setup not supported in piped mode
 
     print("Not in Docker. Setting up container for reliability...")
 
@@ -217,25 +212,21 @@ setup_docker()
 # ──────────────────────────────────────────────────────────
 
 def check_cuda_installed():
+    """Check for CUDA toolkit. Warn on mismatch, exit if missing."""
     try:
         output = subprocess.check_output(["nvcc", "--version"]).decode("utf-8")
         if "release 13.0" in output:
             print("CUDA 13.0 detected.")
-            return True
         else:
             print("CUDA version mismatch. Expected 13.0.")
-            return False
     except (subprocess.CalledProcessError, FileNotFoundError):
-        print("CUDA toolkit (nvcc) not found. Please install CUDA 13.0 following the instructions.")
-        print("Run these commands:")
-        print("wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb")
-        print("sudo dpkg -i cuda-keyring_1.1-1_all.deb")
-        print("sudo apt update")
-        print("sudo apt install cuda-toolkit-13-0")
+        print("CUDA toolkit (nvcc) not found. Please install CUDA 13.0:")
+        print("  wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb")
+        print("  sudo dpkg -i cuda-keyring_1.1-1_all.deb")
+        print("  sudo apt update && sudo apt install cuda-toolkit-13-0")
         print("Then add to ~/.bashrc:")
-        print("export PATH=/usr/local/cuda-13.0/bin${PATH:+:${PATH}}")
-        print("export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}")
-        print("source ~/.bashrc")
+        print("  export PATH=/usr/local/cuda-13.0/bin${PATH:+:${PATH}}")
+        print("  export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}")
         sys.exit(1)
 
 # ──────────────────────────────────────────────────────────
@@ -288,11 +279,11 @@ import numpy as np
 import psutil
 
 def check_torch_cuda():
+    """Verify PyTorch can see CUDA. Exit if not."""
     try:
         import torch
         if torch.cuda.is_available():
             print(f"PyTorch CUDA available: {torch.version.cuda}")
-            return True
         else:
             print("PyTorch CUDA not available. Ensure CUDA toolkit is installed and paths are set.")
             sys.exit(1)
@@ -413,10 +404,6 @@ def get_storage_metrics():
 def print_blue(text):
     print(f"\033[94m{text}\033[0m")
 
-# Function to print in red
-def print_red(text):
-    print(f"\033[91m{text}\033[0m")
-
 # ──────────────────────────────────────────────────────────
 # Main execution
 # ──────────────────────────────────────────────────────────
@@ -450,7 +437,6 @@ if __name__ == "__main__":
             # Split imports so we can see torch loading progress.
             gpu_stress_code = f"""#!/usr/bin/env python3
 import os, sys
-os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu_id}"
 print("GPU stress subprocess started, importing torch...", flush=True)
 import torch
 print(f"Torch loaded: {{torch.__version__}}, CUDA: {{torch.version.cuda}}", flush=True)
@@ -599,7 +585,7 @@ while True:
                 os.remove('Dockerfile')
             try:
                 subprocess.call(["docker", "rmi", "loadup-gpu"])
-            except:
+            except Exception:
                 pass
             print("Cleanup completed.")
         else:
