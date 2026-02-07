@@ -20,7 +20,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.1.9"
+VERSION = "0.2.0"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(
@@ -67,6 +67,45 @@ if is_piped:
         sys.stdin.read()
     except Exception:
         pass
+
+# ──────────────────────────────────────────────────────────
+# AUTO-INSTALL SYSTEM DEPENDENCIES (hands-free operation)
+# ──────────────────────────────────────────────────────────
+
+def install_system_deps():
+    """Detect and auto-install missing system packages."""
+    packages_needed = []
+
+    # python3.X-venv: needed for virtual environment creation
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    try:
+        subprocess.check_call([sys.executable, '-m', 'ensurepip', '--version'],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        packages_needed.append(f"python{py_ver}-venv")
+
+    # lm-sensors: needed for CPU temperature readings
+    try:
+        subprocess.check_call(["sensors", "--version"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        packages_needed.append("lm-sensors")
+
+    if not packages_needed:
+        return  # All deps present
+
+    print(f"Installing missing system packages: {' '.join(packages_needed)}")
+    try:
+        subprocess.check_call(["sudo", "apt-get", "update", "-qq"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.check_call(["sudo", "apt-get", "install", "-y", "-qq"] + packages_needed)
+        print("System packages installed.")
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"ERROR: Failed to install packages: {e}")
+        print(f"Please run manually: sudo apt install {' '.join(packages_needed)}")
+        sys.exit(1)
+
+install_system_deps()
 
 # ──────────────────────────────────────────────────────────
 # EARLY PROMPTS: GPU selection and duration BEFORE any setup
