@@ -4,7 +4,7 @@
 #   curl -s https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py | python3 - --gpu 0 --duration 60 --cleanup y --docker y
 #
 # Arguments:
-#   --gpu N        GPU number to stress test (0, 1, 2, etc.)
+#   --gpu N        GPU to stress: 0, 1, 0,2, or all
 #   --duration N   How many seconds to run the stress test
 #   --cleanup y|n  Remove venv and Docker artifacts after test
 #   --docker y|n   Run inside a Docker container (requires Docker + NVIDIA Container Toolkit)
@@ -21,25 +21,26 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 SCRIPT_URL = "https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(
     description="CPU/GPU Stress Test Script",
     epilog="""Environment variables (override defaults when no TTY):
-  GPU=N         GPU number to stress (same as --gpu)
+  GPU=N         GPU selection: 0, 1, 0,2, or all (same as --gpu)
   DURATION=N    Duration in seconds (same as --duration)
   CLEANUP=y|n   Auto-cleanup after test (same as --cleanup)
   DOCKER=y|n    Run inside Docker container (same as --docker)
 
 Piped usage examples:
-  curl -s URL | python3 - --gpu 0 --duration 60 --cleanup y             # on host
-  curl -s URL | python3 - --gpu 0 --duration 60 --cleanup y --docker y  # in Docker
+  curl -s URL | python3 - --gpu 0 --duration 60 --cleanup y --docker y    # single GPU
+  curl -s URL | python3 - --gpu 0,2 --duration 60 --cleanup y --docker y  # specific GPUs
+  curl -s URL | python3 - --gpu all --duration 60 --cleanup y --docker y  # all GPUs
 """,
     formatter_class=argparse.RawDescriptionHelpFormatter
 )
-parser.add_argument("--gpu", type=int, default=None, help="GPU number to stress (default: prompt or 0)")
+parser.add_argument("--gpu", type=str, default=None, help="GPU to stress: 0, 1, 0,2, or all (default: prompt or 0)")
 parser.add_argument("--duration", type=int, default=None, help="Duration in seconds (default: prompt or 30)")
 parser.add_argument("--cleanup", type=str, default=None, choices=["y", "n"],
                     help="Cleanup venv/Dockerfile after test: y or n (default: prompt or skip)")
@@ -48,8 +49,8 @@ parser.add_argument("--docker", type=str, default=None, choices=["y", "n"],
 args = parser.parse_args()
 
 # Apply environment variable fallbacks (CLI args take priority)
-if args.gpu is None and os.environ.get("GPU", "").strip().lstrip("-").isdigit():
-    args.gpu = int(os.environ["GPU"])
+if args.gpu is None and os.environ.get("GPU", "").strip():
+    args.gpu = os.environ["GPU"].strip()
 if args.duration is None and os.environ.get("DURATION", "").strip().isdigit():
     args.duration = int(os.environ["DURATION"])
 if args.cleanup is None and os.environ.get("CLEANUP", "").strip().lower() in ("y", "n"):
@@ -68,8 +69,8 @@ is_piped = not os.isatty(sys.stdin.fileno())
 
 if is_piped:
     print("Piped execution detected. To customize, use CLI args or env vars:")
-    print("  curl -s URL | python3 - --gpu 0 --duration 60 --cleanup y")
     print("  curl -s URL | python3 - --gpu 0 --duration 60 --cleanup y --docker y")
+    print("  curl -s URL | python3 - --gpu all --duration 60 --cleanup y --docker y")
     print("For interactive prompts, download and run as file instead:")
     print(f"  curl -s -O {SCRIPT_URL} && python3 loadup.py")
     # Drain any remaining stdin so it doesn't interfere with subprocesses
@@ -251,10 +252,13 @@ def get_gpu_list():
         return []
 
 # Resolve GPU selection: CLI/env > interactive prompt > default
+# gpu_ids will be a list of ints, e.g. [0], [0,2], [0,1,2], or [] if no GPUs
 gpus = get_gpu_list()
+available_ids = [idx for idx, _ in gpus]
+
 if not gpus:
     print("No NVIDIA GPUs found. GPU stress will be disabled.")
-    args.gpu = -1  # Sentinel: no GPU available
+    gpu_ids = []
 else:
     print("Available GPUs:")
     for idx, name in gpus:
@@ -262,18 +266,37 @@ else:
 
     if args.gpu is None:
         if os.isatty(sys.stdin.fileno()):
-            gpu_input = input("Enter GPU number to stress (default 0): ").strip()
-            args.gpu = int(gpu_input) if gpu_input else 0
+            gpu_input = input("Enter GPU(s) to stress (0, 0,2, or all; default 0): ").strip()
+            args.gpu = gpu_input if gpu_input else "0"
         else:
-            args.gpu = 0
+            args.gpu = "0"
             print(f"Using default GPU {args.gpu}.")
-    else:
-        print(f"Using GPU {args.gpu} (from {'--gpu' if '--gpu' in sys.argv else 'GPU env var'}).")
 
-    # Always validate GPU ID
-    if args.gpu not in [idx for idx, _ in gpus]:
-        print(f"Invalid GPU number {args.gpu}. Available: {[idx for idx, _ in gpus]}. Exiting.")
-        sys.exit(1)
+    # Parse --gpu value into list
+    gpu_str = str(args.gpu).strip().lower()
+    if gpu_str == "all":
+        gpu_ids = available_ids[:]
+    else:
+        try:
+            gpu_ids = [int(x.strip()) for x in gpu_str.split(",")]
+        except ValueError:
+            print(f"Invalid GPU selection: {args.gpu}. Use: 0, 0,2, or all")
+            sys.exit(1)
+
+    # Validate each GPU ID
+    for gid in gpu_ids:
+        if gid not in available_ids:
+            print(f"Invalid GPU number {gid}. Available: {available_ids}. Exiting.")
+            sys.exit(1)
+
+    src = '--gpu' if '--gpu' in sys.argv else 'GPU env var'
+    if len(gpu_ids) == 1:
+        print(f"Using GPU {gpu_ids[0]} (from {src}).")
+    else:
+        print(f"Using GPUs {gpu_ids} (from {src}).")
+
+# Store the resolved string for passing through argv
+args.gpu = ",".join(str(g) for g in gpu_ids) if gpu_ids else None
 
 # Resolve duration: CLI/env > interactive prompt > default
 if args.duration is None:
@@ -400,7 +423,7 @@ RUN python3 -m venv /app/venv && \\
     docker_cmd.extend([
         "loadup-gpu",
         "/app/venv/bin/python", "/app/loadup.py",
-        "--gpu", str(args.gpu), "--duration", str(args.duration),
+        "--gpu", args.gpu, "--duration", str(args.duration),
     ])
     if args.cleanup:
         docker_cmd.extend(["--cleanup", args.cleanup])
@@ -409,7 +432,7 @@ RUN python3 -m venv /app/venv && \\
     # Docker containers share the host CPU/kernel, so RAPL on the host
     # accurately measures CPU power consumed by the containerized workload.
     docker_proc = subprocess.Popen(docker_cmd)
-    host_peak_gpu = 0.0
+    host_peak_gpus = {gid: 0.0 for gid in gpu_ids}  # Per-GPU peak tracking
     host_peak_cpu = 0.0
     rapl_path = "/sys/class/powercap/intel-rapl:0/energy_uj"
     rapl_ok = os.path.exists(rapl_path)
@@ -431,17 +454,18 @@ RUN python3 -m venv /app/venv && \\
             except Exception:
                 rapl_ok = False
 
-        # Read GPU power via nvidia-smi on host
-        try:
-            gpu_out = subprocess.check_output(
-                ["nvidia-smi", "-i", str(args.gpu),
-                 "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
-                stderr=subprocess.DEVNULL).decode().strip()
-            gpu_w = float(gpu_out)
-            if gpu_w > host_peak_gpu:
-                host_peak_gpu = gpu_w
-        except Exception:
-            pass
+        # Read GPU power via nvidia-smi on host (all selected GPUs)
+        for gid in gpu_ids:
+            try:
+                gpu_out = subprocess.check_output(
+                    ["nvidia-smi", "-i", str(gid),
+                     "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+                    stderr=subprocess.DEVNULL).decode().strip()
+                gpu_w = float(gpu_out)
+                if gpu_w > host_peak_gpus[gid]:
+                    host_peak_gpus[gid] = gpu_w
+            except Exception:
+                pass
 
         time.sleep(1)
 
@@ -450,15 +474,17 @@ RUN python3 -m venv /app/venv && \\
     # Print host-side power summary (RAPL works here even though container can't read it)
     BLUE = "\033[94m"
     RESET = "\033[0m"
-    if host_peak_gpu > 0 or host_peak_cpu > 0:
+    total_gpu_peak = sum(host_peak_gpus.values())
+    if total_gpu_peak > 0 or host_peak_cpu > 0:
         print(f"{BLUE}Host-Side Peak Power (measured during Docker run):{RESET}")
-        if host_peak_gpu > 0:
-            print(f"{BLUE}  GPU Peak: {host_peak_gpu:.1f} W{RESET}")
+        for gid in gpu_ids:
+            if host_peak_gpus[gid] > 0:
+                print(f"{BLUE}  GPU {gid} Peak: {host_peak_gpus[gid]:.1f} W{RESET}")
         if host_peak_cpu > 0:
             print(f"{BLUE}  CPU Peak: {host_peak_cpu:.1f} W{RESET}")
         else:
             print(f"{BLUE}  CPU Peak: N/A (RAPL not available){RESET}")
-        total = host_peak_gpu + host_peak_cpu
+        total = total_gpu_peak + host_peak_cpu
         if total > 0:
             label = "GPU + CPU" if host_peak_cpu > 0 else "GPU only"
             print(f"{BLUE}  Total Measured Peak: {total:.1f} W ({label}){RESET}")
@@ -724,48 +750,41 @@ def print_blue(text):
 # ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # GPU and duration were already collected at the top of the script
-    gpu_id = args.gpu if args.gpu is not None and args.gpu >= 0 else None
+    # gpu_ids and duration were already resolved at the top of the script
     duration = args.duration if args.duration is not None else 30
 
-    # Multiprocessing strategy depends on execution mode:
-    # - Piped mode (curl | python3 -): 'spawn' fails because __file__ is <stdin>,
-    #   and child processes can't re-import from '/home/user/<stdin>'.
-    #   Use 'fork' for CPU workers (numpy only, no CUDA), and subprocess for GPU.
-    # - File mode (python3 loadup.py): 'spawn' works normally for CUDA safety.
+    # Multiprocessing strategy depends on execution mode
     if is_piped:
         cpu_ctx = mp.get_context('fork')
     else:
         mp.set_start_method('spawn')
         cpu_ctx = mp.get_context('spawn')
 
-    print(f"\nStarting CPU and GPU stress test for {duration} seconds on GPU {gpu_id if gpu_id is not None else 'N/A'}. Press Ctrl+C to stop early.")
+    gpu_label = ",".join(str(g) for g in gpu_ids) if gpu_ids else "N/A"
+    print(f"\nStarting CPU and GPU stress test for {duration} seconds on GPU {gpu_label}. Press Ctrl+C to stop early.")
     print("Metrics will update every 5 seconds.\n")
 
     # ── GPU stress FIRST (needs CPU to import torch before CPU saturation) ──
-    gpu_process = None
-    _gpu_temp_file = None  # Track temp file for cleanup
-    if gpu_id is not None:
+    gpu_processes = []      # List of (gpu_id, process) tuples
+    _gpu_temp_files = []    # Track temp files for cleanup
+
+    for gid in gpu_ids:
         if is_piped:
-            # Piped mode: use subprocess with venv python to avoid spawn __file__ issue.
-            # Write GPU code to a temp file (more reliable than -c for complex scripts).
-            # Split imports so we can see torch loading progress.
             gpu_stress_code = f"""#!/usr/bin/env python3
 import os, sys, time as _time
-print("GPU stress subprocess started, importing torch...", flush=True)
+os.environ["CUDA_VISIBLE_DEVICES"] = "{gid}"
+print("GPU {gid}: importing torch...", flush=True)
 import torch
-print(f"Torch loaded: {{torch.__version__}}, CUDA: {{torch.version.cuda}}", flush=True)
+print(f"GPU {gid}: Torch {{torch.__version__}}, CUDA {{torch.version.cuda}}", flush=True)
 if not torch.cuda.is_available():
-    print("CUDA not available on GPU {gpu_id}. GPU stress disabled.", flush=True)
+    print("GPU {gid}: CUDA not available. Disabled.", flush=True)
     sys.exit(1)
 device = torch.device("cuda")
-print(f"CUDA available on GPU {gpu_id}: True", flush=True)
-print(f"Using device: {{torch.cuda.get_device_name(device)}}", flush=True)
+print(f"GPU {gid}: {{torch.cuda.get_device_name(device)}}", flush=True)
 size = 20000
 _start = _time.time()
 _duration = {duration}
 while True:
-    remaining = max(0, int(_duration - (_time.time() - _start)))
     try:
         a = torch.rand(size, size, device=device)
         b = torch.rand(size, size, device=device)
@@ -773,79 +792,77 @@ while True:
             c = torch.mm(a, b)
         torch.cuda.synchronize()
         remaining = max(0, int(_duration - (_time.time() - _start)))
-        print(f"Running system load  {{remaining}}s remaining", flush=True)
+        print(f"Running system load  {{remaining}}s remaining  (GPU {gid})", flush=True)
     except Exception as e:
-        print(f"GPU stress error: {{e}}", flush=True)
+        print(f"GPU {gid} stress error: {{e}}", flush=True)
         break
 """
             _gpu_temp = tempfile.NamedTemporaryFile(
-                mode='w', suffix='_gpu_stress.py', delete=False, dir=os.getcwd()
+                mode='w', suffix=f'_gpu{gid}_stress.py', delete=False, dir=os.getcwd()
             )
             _gpu_temp.write(gpu_stress_code)
             _gpu_temp.close()
-            _gpu_temp_file = _gpu_temp.name
-            print(f"GPU stress: launching subprocess with {_venv_python}")
-            gpu_process = subprocess.Popen(
-                [_venv_python, "-u", _gpu_temp_file],
-                env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id), "PYTHONUNBUFFERED": "1"}
+            _gpu_temp_files.append(_gpu_temp.name)
+            print(f"GPU {gid}: launching subprocess with {_venv_python}")
+            proc = subprocess.Popen(
+                [_venv_python, "-u", _gpu_temp.name],
+                env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gid), "PYTHONUNBUFFERED": "1"}
             )
-            # Brief check: did the subprocess crash immediately?
             time.sleep(1)
-            rc = gpu_process.poll()
+            rc = proc.poll()
             if rc is not None:
-                print(f"WARNING: GPU stress subprocess exited immediately with code {rc}")
-                gpu_process = None
+                print(f"WARNING: GPU {gid} stress subprocess exited immediately with code {rc}")
             else:
-                print(f"GPU stress subprocess running (PID {gpu_process.pid})")
+                print(f"GPU {gid}: stress subprocess running (PID {proc.pid})")
+                gpu_processes.append((gid, proc))
         else:
-            gpu_process = mp.Process(target=gpu_stress, args=(gpu_id,))
-            gpu_process.daemon = True
-            gpu_process.start()
+            proc = mp.Process(target=gpu_stress, args=(gid,))
+            proc.daemon = True
+            proc.start()
+            gpu_processes.append((gid, proc))
 
-        # Wait for GPU stress to initialize before saturating CPU.
-        # Torch import + CUDA init is CPU-intensive; CPU workers would starve it.
+    if gpu_ids:
+        # Wait for at least one GPU to become active before starting CPU stress
         print("Waiting for GPU stress to become active before starting CPU stress...")
         gpu_ready = False
-        for _wait in range(20):  # Up to 20 seconds
+        for _wait in range(20):
             time.sleep(1)
-            metrics = get_gpu_metrics(gpu_id)
-            if metrics:
-                util_str = metrics.get("GPU Utilization", "0 %").strip()
-                # Check if GPU utilization is above 0%
-                if util_str and not util_str.startswith("0"):
-                    print(f"GPU stress active (utilization: {util_str}). Starting CPU stress...")
-                    gpu_ready = True
-                    break
-            # Also check if subprocess crashed
-            if is_piped and gpu_process and gpu_process.poll() is not None:
-                print(f"WARNING: GPU subprocess exited with code {gpu_process.returncode}")
+            for gid in gpu_ids:
+                metrics = get_gpu_metrics(gid)
+                if metrics:
+                    util_str = metrics.get("GPU Utilization", "0 %").strip()
+                    if util_str and not util_str.startswith("0"):
+                        print(f"GPU {gid} stress active (utilization: {util_str}). Starting CPU stress...")
+                        gpu_ready = True
+                        break
+            if gpu_ready:
                 break
         if not gpu_ready:
             print("GPU stress may still be initializing. Starting CPU stress anyway...")
 
     # ── CPU stress AFTER GPU is active ──
     num_cores = mp.cpu_count()
-    cpu_processes = [cpu_ctx.Process(target=cpu_stress_worker) for _ in range(num_cores)]
-    for p in cpu_processes:
+    cpu_processes_list = [cpu_ctx.Process(target=cpu_stress_worker) for _ in range(num_cores)]
+    for p in cpu_processes_list:
         p.daemon = True
         p.start()
 
-    # Track peak power during stress test
-    peak_gpu_watts = 0.0
+    # Track peak power during stress test (per GPU)
+    peak_gpu_watts = {gid: 0.0 for gid in gpu_ids}
     peak_cpu_watts = 0.0
 
     start_time = time.time()
     try:
         while time.time() - start_time < duration:
-            if gpu_id is not None:
-                gpu_data = get_gpu_metrics(gpu_id)
+            for gid in gpu_ids:
+                gpu_data = get_gpu_metrics(gid)
                 if gpu_data:
-                    print("GPU Metrics:")
+                    print(f"GPU {gid} Metrics:")
                     for key, value in gpu_data.items():
                         print(f"  {key}: {value}")
                     gw = parse_gpu_power(gpu_data)
-                    if gw and gw > peak_gpu_watts:
-                        peak_gpu_watts = gw
+                    if gw and gw > peak_gpu_watts[gid]:
+                        peak_gpu_watts[gid] = gw
 
             cpu_power = get_cpu_power()
             if cpu_power and cpu_power > peak_cpu_watts:
@@ -864,10 +881,10 @@ while True:
         print("Stopping stress test early.")
     finally:
         print("Stress test completed.")
-        for p in cpu_processes:
+        for p in cpu_processes_list:
             p.terminate()
-        if gpu_process:
-            gpu_process.terminate()
+        for gid, proc in gpu_processes:
+            proc.terminate()
 
         # Wait a moment for systems to settle
         time.sleep(2)
@@ -875,10 +892,10 @@ while True:
         # Print final metrics in blue
         print_blue("-" * 40)
         print_blue("Completed Full Load -- MANUALLY CHECK FOR IDLE/NORMALCY")
-        if gpu_id is not None:
-            gpu_data = get_gpu_metrics(gpu_id)
+        for gid in gpu_ids:
+            gpu_data = get_gpu_metrics(gid)
             if gpu_data:
-                print_blue("GPU Metrics:")
+                print_blue(f"GPU {gid} Metrics:")
                 for key, value in gpu_data.items():
                     print_blue(f"  {key}: {value}")
 
@@ -901,9 +918,10 @@ while True:
         if not os.environ.get("LOADUP_DOCKER_HOST_MONITORS_POWER"):
             print_blue("\nPeak Power During Stress Test:")
             total_peak = 0.0
-            if peak_gpu_watts > 0:
-                print_blue(f"  GPU Peak: {peak_gpu_watts:.1f} W")
-                total_peak += peak_gpu_watts
+            for gid in gpu_ids:
+                if peak_gpu_watts[gid] > 0:
+                    print_blue(f"  GPU {gid} Peak: {peak_gpu_watts[gid]:.1f} W")
+                    total_peak += peak_gpu_watts[gid]
             if peak_cpu_watts > 0:
                 print_blue(f"  CPU Peak: {peak_cpu_watts:.1f} W")
                 total_peak += peak_cpu_watts
@@ -915,7 +933,6 @@ while True:
 
         # Cleanup prompt
         if args.cleanup is not None:
-            # Cleanup was specified via --cleanup or CLEANUP env var
             do_cleanup = args.cleanup == 'y'
             print(f"Cleanup {'enabled' if do_cleanup else 'skipped'} (from {'--cleanup' if '--cleanup' in sys.argv else 'CLEANUP env var'}).")
         elif os.isatty(sys.stdin.fileno()):
@@ -939,8 +956,9 @@ while True:
         else:
             print("Cleanup skipped.")
 
-        # Clean up GPU temp script if it was created
-        if _gpu_temp_file and os.path.exists(_gpu_temp_file):
-            os.remove(_gpu_temp_file)
+        # Clean up GPU temp scripts if created
+        for tf in _gpu_temp_files:
+            if os.path.exists(tf):
+                os.remove(tf)
 
         sys.exit(0)
