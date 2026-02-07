@@ -1,5 +1,4 @@
-# I use this script to test peak wattages on PC builds
-# (with a meter from the wall)
+# Load your GPU and CPU 100% with customized durations.
 ```
 !/usr/bin/env python3
  ──────────────────────────────────────────────────────────
