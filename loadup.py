@@ -20,7 +20,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.2.1"
+VERSION = "0.2.3"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(
@@ -94,19 +94,51 @@ def install_system_deps():
     if not packages_needed:
         return  # All deps present
 
-    print(f"Installing missing system packages: {' '.join(packages_needed)}")
-    try:
-        # Try install directly first (works if package cache exists)
-        result = subprocess.run(["sudo", "apt-get", "install", "-y"] + packages_needed,
-                                capture_output=True, text=True)
-        if result.returncode != 0:
-            # Cache miss or stale -- update and retry
-            print("Updating package lists...")
-            subprocess.check_call(["sudo", "apt-get", "update"])
-            subprocess.check_call(["sudo", "apt-get", "install", "-y"] + packages_needed)
+    # Determine sudo mode:
+    # -n (passwordless) if available, otherwise regular sudo (prompts via /dev/tty)
+    has_passwordless_sudo = subprocess.run(
+        ["sudo", "-n", "true"], capture_output=True).returncode == 0
+    if has_passwordless_sudo:
+        sudo = ["sudo"]
+    elif os.path.exists("/dev/tty"):
+        # sudo will prompt for password on the terminal even in piped mode
+        print(f"Missing packages: {' '.join(packages_needed)}")
+        print("sudo password may be required...")
+        sudo = ["sudo"]
+    else:
+        print(f"Missing packages: {' '.join(packages_needed)}")
+        print(f"No sudo access and no terminal for password prompt.")
+        print(f"Please run manually: sudo apt install {' '.join(packages_needed)}")
+        sys.exit(1)
+
+    print(f"Installing system packages: {' '.join(packages_needed)}")
+    installed = False
+
+    # Attempt 1: install directly (works if package cache exists)
+    r = subprocess.run(sudo + ["apt-get", "install", "-y"] + packages_needed)
+    if r.returncode == 0:
+        installed = True
+
+    # Attempt 2: update package lists, then install
+    if not installed:
+        print("Package cache outdated. Running apt-get update...")
+        subprocess.run(sudo + ["apt-get", "update"])
+        r = subprocess.run(sudo + ["apt-get", "install", "-y"] + packages_needed)
+        if r.returncode == 0:
+            installed = True
+
+    # Attempt 3: fix broken packages, then install
+    if not installed:
+        print("Attempting to fix broken packages...")
+        subprocess.run(sudo + ["apt-get", "install", "--fix-broken", "-y"])
+        r = subprocess.run(sudo + ["apt-get", "install", "-y"] + packages_needed)
+        if r.returncode == 0:
+            installed = True
+
+    if installed:
         print("System packages installed.")
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"ERROR: Failed to install packages: {e}")
+    else:
+        print(f"ERROR: Could not install packages automatically.")
         print(f"Please run manually: sudo apt install {' '.join(packages_needed)}")
         sys.exit(1)
 
