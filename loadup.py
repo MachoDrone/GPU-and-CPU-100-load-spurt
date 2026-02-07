@@ -21,7 +21,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 SCRIPT_URL = "https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py"
 
 # Parse command-line arguments FIRST (before any setup)
@@ -83,14 +83,19 @@ if is_piped:
 # ──────────────────────────────────────────────────────────
 
 def _get_sudo():
-    """Determine sudo command. Returns list like ['sudo'] or exits if no sudo available."""
-    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
-        return ["sudo"]
-    elif os.path.exists("/dev/tty"):
-        print("sudo password may be required...")
-        return ["sudo"]
-    else:
-        return None
+    """Determine sudo command. Returns [] if root, ['sudo'] if available, None if no access."""
+    # Already root (e.g., inside Docker) -- no sudo needed
+    if os.getuid() == 0:
+        return []
+    try:
+        if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
+            return ["sudo"]
+        elif os.path.exists("/dev/tty"):
+            print("sudo password may be required...")
+            return ["sudo"]
+    except FileNotFoundError:
+        pass  # sudo not installed
+    return None
 
 def install_system_deps():
     """Detect and auto-install missing system packages + fix RAPL permissions."""
