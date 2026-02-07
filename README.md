@@ -1,4 +1,4 @@
-# I use this script to test peak wattages on PC builds.
+# I use this script to test peak wattages on PC builds (with a meter from the wall).
 ```
 !/usr/bin/env python3
  ──────────────────────────────────────────────────────────
