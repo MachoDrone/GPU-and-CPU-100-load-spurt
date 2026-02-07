@@ -8,13 +8,36 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 # Parse command-line arguments FIRST (before any setup)
-parser = argparse.ArgumentParser(description="CPU/GPU Stress Test Script")
+parser = argparse.ArgumentParser(
+    description="CPU/GPU Stress Test Script",
+    epilog="""Environment variables (override defaults when no TTY):
+  GPU=N         GPU number to stress (same as --gpu)
+  DURATION=N    Duration in seconds (same as --duration)
+  CLEANUP=y|n   Auto-cleanup after test (same as --cleanup)
+
+Piped usage examples:
+  curl -s URL | python3 -                                    # defaults: GPU 0, 30s, no cleanup
+  curl -s URL | python3 - --gpu 2 --duration 60 --cleanup y  # CLI args
+  curl -s URL | GPU=2 DURATION=60 CLEANUP=y python3 -        # env vars
+""",
+    formatter_class=argparse.RawDescriptionHelpFormatter
+)
 parser.add_argument("--gpu", type=int, default=None, help="GPU number to stress (default: prompt or 0)")
 parser.add_argument("--duration", type=int, default=None, help="Duration in seconds (default: prompt or 30)")
+parser.add_argument("--cleanup", type=str, default=None, choices=["y", "n"],
+                    help="Cleanup venv/Dockerfile after test: y or n (default: prompt or skip)")
 args = parser.parse_args()
+
+# Apply environment variable fallbacks (CLI args take priority)
+if args.gpu is None and os.environ.get("GPU", "").strip().lstrip("-").isdigit():
+    args.gpu = int(os.environ["GPU"])
+if args.duration is None and os.environ.get("DURATION", "").strip().isdigit():
+    args.duration = int(os.environ["DURATION"])
+if args.cleanup is None and os.environ.get("CLEANUP", "").strip().lower() in ("y", "n"):
+    args.cleanup = os.environ["CLEANUP"].strip().lower()
 
 print(f"Version: {VERSION}")
 
@@ -22,7 +45,10 @@ print(f"Version: {VERSION}")
 is_piped = not os.isatty(sys.stdin.fileno())
 
 if is_piped:
-    print("Piped execution detected. For interactive prompts, download and run as file instead:")
+    print("Piped execution detected. To customize, use CLI args or env vars:")
+    print("  curl -s URL | python3 - --gpu 2 --duration 60 --cleanup y")
+    print("  curl -s URL | GPU=2 DURATION=60 CLEANUP=y python3 -")
+    print("For interactive prompts, download and run as file instead:")
     print("  curl -s -O https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py && python3 loadup.py")
     # Drain any remaining stdin so it doesn't interfere with subprocesses
     try:
@@ -51,8 +77,8 @@ def get_gpu_list():
         print(f"Error listing GPUs: {e}")
         return []
 
-# Only prompt if values weren't already provided via CLI args
-# (CLI args are set when re-executing through venv/Docker)
+# Only prompt if values weren't already provided via CLI args or env vars
+# (CLI args are also set when re-executing through venv/Docker)
 if args.gpu is None or args.duration is None:
     gpus = get_gpu_list()
     if not gpus:
@@ -69,29 +95,34 @@ if args.gpu is None or args.duration is None:
                 gpu_input = input("Enter GPU number to stress (default 0): ").strip()
                 args.gpu = int(gpu_input) if gpu_input else 0
             else:
-                print("No TTY detected. Using default GPU 0.")
                 args.gpu = 0
-            # Validate GPU ID
-            if args.gpu not in [idx for idx, _ in gpus]:
-                print(f"Invalid GPU number {args.gpu}. Exiting.")
-                sys.exit(1)
+                print(f"Using default GPU {args.gpu}.")
+        else:
+            print(f"Using GPU {args.gpu} (from {'--gpu' if '--gpu' in sys.argv else 'GPU env var'}).")
+
+        # Validate GPU ID
+        if args.gpu not in [idx for idx, _ in gpus]:
+            print(f"Invalid GPU number {args.gpu}. Exiting.")
+            sys.exit(1)
 
     if args.duration is None:
         if os.isatty(sys.stdin.fileno()):
             duration_input = input("Enter number of seconds to run (default 30): ").strip()
             args.duration = 30 if not duration_input else int(duration_input)
         else:
-            print("No TTY detected. Using default duration 30 seconds.")
             args.duration = 30
+            print(f"Using default duration {args.duration} seconds.")
+    else:
+        print(f"Using duration {args.duration}s (from {'--duration' if '--duration' in sys.argv else 'DURATION env var'}).")
 
-# Inject --gpu and --duration into sys.argv so they carry through os.execv
+# Inject --gpu, --duration, --cleanup into sys.argv so they carry through os.execv
 def ensure_args_in_argv():
-    """Make sure --gpu and --duration are in sys.argv for re-execution"""
+    """Make sure --gpu, --duration, --cleanup are in sys.argv for re-execution"""
     new_argv = [sys.argv[0]]
     i = 1
     while i < len(sys.argv):
-        if sys.argv[i] in ('--gpu', '--duration') and i + 1 < len(sys.argv):
-            i += 2  # Skip existing --gpu/--duration and their values
+        if sys.argv[i] in ('--gpu', '--duration', '--cleanup') and i + 1 < len(sys.argv):
+            i += 2  # Skip existing arg and its value
         else:
             new_argv.append(sys.argv[i])
             i += 1
@@ -99,6 +130,8 @@ def ensure_args_in_argv():
         new_argv.extend(["--gpu", str(args.gpu)])
     if args.duration is not None:
         new_argv.extend(["--duration", str(args.duration)])
+    if args.cleanup is not None:
+        new_argv.extend(["--cleanup", str(args.cleanup)])
     sys.argv = new_argv
 
 ensure_args_in_argv()
@@ -170,8 +203,8 @@ CMD ["/app/venv/bin/python", "/app/loadup.py"]
         "-v", f"{os.getcwd()}:/app",  # Mount current dir if needed
         "loadup-gpu",
         "/app/venv/bin/python", "/app/loadup.py",
-        "--gpu", str(args.gpu), "--duration", str(args.duration)
-    ]
+        "--gpu", str(args.gpu), "--duration", str(args.duration),
+    ] + (["--cleanup", args.cleanup] if args.cleanup else [])
     if os.isatty(sys.stdin.fileno()):
         docker_cmd.insert(3, "-it")  # Add -it only if TTY available
     os.execvp("docker", docker_cmd)  # Replace current process with Docker run
@@ -548,11 +581,15 @@ while True:
 
         # Cleanup prompt
         print("\nyou can cleanup now or cleanup later by running this script again")
-        if os.isatty(sys.stdin.fileno()):
+        if args.cleanup is not None:
+            # Cleanup was specified via --cleanup or CLEANUP env var
+            do_cleanup = args.cleanup == 'y'
+            print(f"Cleanup {'enabled' if do_cleanup else 'skipped'} (from {'--cleanup' if '--cleanup' in sys.argv else 'CLEANUP env var'}).")
+        elif os.isatty(sys.stdin.fileno()):
             cleanup_input = input("\033[91mCleanup now? (Y/n): \033[0m").strip().lower()
             do_cleanup = cleanup_input == '' or cleanup_input == 'y'
         else:
-            print("No TTY detected. Skipping cleanup prompt (use Y/n interactively next time).")
+            print("No TTY detected. Skipping cleanup (use --cleanup y or CLEANUP=y to auto-cleanup).")
             do_cleanup = False
 
         if do_cleanup:
