@@ -8,7 +8,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(
@@ -239,12 +239,23 @@ _venv_python = sys.executable  # Default: current interpreter (correct if alread
 # Check if running in a virtual environment
 if sys.prefix == sys.base_prefix:
     venv_dir = 'venv'
-    print("Setting up virtual environment...")
-    if not os.path.exists(venv_dir):
-        subprocess.check_call([sys.executable, '-m', 'venv', venv_dir])
-
     venv_pip = os.path.join(venv_dir, 'bin', 'pip')
     venv_python = os.path.join(venv_dir, 'bin', 'python')
+
+    # Create venv if missing or broken (pip missing after partial cleanup)
+    if not os.path.exists(venv_pip):
+        print("Setting up virtual environment...")
+        subprocess.check_call([sys.executable, '-m', 'venv', '--clear', venv_dir])
+        # If pip still missing, try ensurepip
+        if not os.path.exists(venv_pip):
+            print("pip not found in venv, bootstrapping with ensurepip...")
+            subprocess.check_call([os.path.join(venv_dir, 'bin', 'python'),
+                                   '-m', 'ensurepip', '--upgrade'])
+        if not os.path.exists(venv_pip):
+            print("ERROR: Could not create venv with pip. Try: sudo apt install python3-venv")
+            sys.exit(1)
+    else:
+        print("Virtual environment found.")
 
     # Install dependencies in the venv
     subprocess.check_call([venv_pip, 'install', 'numpy', 'psutil'])
