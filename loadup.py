@@ -21,7 +21,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 SCRIPT_URL = "https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py"
 
 # Parse command-line arguments FIRST (before any setup)
@@ -57,7 +57,9 @@ if args.cleanup is None and os.environ.get("CLEANUP", "").strip().lower() in ("y
 if args.docker is None and os.environ.get("DOCKER", "").strip().lower() in ("y", "n"):
     args.docker = os.environ["DOCKER"].strip().lower()
 
-print(f"Version: {VERSION}")
+print(f"\033[94mVersion: {VERSION}\033[0m")
+print("\033[91mDOCKER CONTAINER CREATION MAY HAVE LONG PAUSES -- THIS IS NORMAL\033[0m")
+time.sleep(3)
 
 # Detect if script is being piped (e.g., curl | python3 -)
 is_piped = not os.isatty(sys.stdin.fileno())
@@ -379,7 +381,7 @@ RUN python3 -m venv /app/venv && \\
             os.remove(script_path)
         subprocess.call(["docker", "rmi", "loadup-gpu"],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print("Docker artifacts cleaned up.")
+        print("\033[94mDocker artifacts cleaned up.\033[0m")
 
     sys.exit(ret)
 
@@ -504,6 +506,8 @@ def gpu_stress(gpu_id):
         device = torch.device("cuda")
         print(f"Using device: {torch.cuda.get_device_name(device)}")
         size = 20000  # Increased size for more stress
+        _start = time.time()
+        _dur = args.duration if args.duration else 30
         while True:
             try:
                 a = torch.rand(size, size, device=device)
@@ -511,7 +515,8 @@ def gpu_stress(gpu_id):
                 for _ in range(10):
                     c = torch.mm(a, b)
                 torch.cuda.synchronize()
-                print("Completed GPU stress iteration")
+                remaining = max(0, int(_dur - (time.time() - _start)))
+                print(f"Running system load  {remaining}s remaining")
             except Exception as e:
                 print(f"GPU stress error: {e}")
                 break
@@ -619,7 +624,7 @@ if __name__ == "__main__":
             # Write GPU code to a temp file (more reliable than -c for complex scripts).
             # Split imports so we can see torch loading progress.
             gpu_stress_code = f"""#!/usr/bin/env python3
-import os, sys
+import os, sys, time as _time
 print("GPU stress subprocess started, importing torch...", flush=True)
 import torch
 print(f"Torch loaded: {{torch.__version__}}, CUDA: {{torch.version.cuda}}", flush=True)
@@ -630,14 +635,18 @@ device = torch.device("cuda")
 print(f"CUDA available on GPU {gpu_id}: True", flush=True)
 print(f"Using device: {{torch.cuda.get_device_name(device)}}", flush=True)
 size = 20000
+_start = _time.time()
+_duration = {duration}
 while True:
+    remaining = max(0, int(_duration - (_time.time() - _start)))
     try:
         a = torch.rand(size, size, device=device)
         b = torch.rand(size, size, device=device)
         for _ in range(10):
             c = torch.mm(a, b)
         torch.cuda.synchronize()
-        print("Completed GPU stress iteration", flush=True)
+        remaining = max(0, int(_duration - (_time.time() - _start)))
+        print(f"Running system load  {{remaining}}s remaining", flush=True)
     except Exception as e:
         print(f"GPU stress error: {{e}}", flush=True)
         break
@@ -725,7 +734,7 @@ while True:
 
         # Print final metrics in blue
         print_blue("-" * 40)
-        print_blue("Completed Full Load -- CHECK FOR IDLE/NORMALCY")
+        print_blue("Completed Full Load -- MANUALLY CHECK FOR IDLE/NORMALCY")
         if gpu_id is not None:
             gpu_data = get_gpu_metrics(gpu_id)
             if gpu_data:
@@ -770,7 +779,7 @@ while True:
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
-            print("Cleanup completed.")
+            print_blue("Cleanup completed.")
         else:
             print("Cleanup skipped.")
 
