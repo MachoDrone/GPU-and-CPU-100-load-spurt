@@ -7,7 +7,8 @@ import os
 import re
 import platform
 import argparse
-VERSION = "0.1.2"
+import tempfile
+VERSION = "0.1.3"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(description="CPU/GPU Stress Test Script")
@@ -415,20 +416,23 @@ if __name__ == "__main__":
 
     # Start GPU stress in a separate process if GPU available
     gpu_process = None
+    _gpu_temp_file = None  # Track temp file for cleanup
     if gpu_id is not None:
         if is_piped:
-            # Piped mode: use subprocess with venv python to avoid spawn __file__ issue
-            gpu_stress_code = f'''
+            # Piped mode: use subprocess with venv python to avoid spawn __file__ issue.
+            # Write GPU code to a temp file (more reliable than -c for complex scripts).
+            gpu_stress_code = f"""#!/usr/bin/env python3
 import os, sys, torch
 os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu_id}"
-print(f"Torch version: {{torch.__version__}}")
-print(f"CUDA version in Torch: {{torch.version.cuda}}")
+print(f"GPU stress subprocess started (PID={{os.getpid()}})", flush=True)
+print(f"Torch version: {{torch.__version__}}", flush=True)
+print(f"CUDA version in Torch: {{torch.version.cuda}}", flush=True)
 if not torch.cuda.is_available():
-    print("CUDA not available on GPU {gpu_id}. GPU stress disabled.")
+    print("CUDA not available on GPU {gpu_id}. GPU stress disabled.", flush=True)
     sys.exit(1)
 device = torch.device("cuda")
-print(f"CUDA available on GPU {gpu_id}: True")
-print(f"Using device: {{torch.cuda.get_device_name(device)}}")
+print(f"CUDA available on GPU {gpu_id}: True", flush=True)
+print(f"Using device: {{torch.cuda.get_device_name(device)}}", flush=True)
 size = 20000
 while True:
     try:
@@ -437,15 +441,30 @@ while True:
         for _ in range(10):
             c = torch.mm(a, b)
         torch.cuda.synchronize()
-        print("Completed GPU stress iteration")
+        print("Completed GPU stress iteration", flush=True)
     except Exception as e:
-        print(f"GPU stress error: {{e}}")
+        print(f"GPU stress error: {{e}}", flush=True)
         break
-'''
-            gpu_process = subprocess.Popen(
-                [_venv_python, "-c", gpu_stress_code],
-                env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)}
+"""
+            _gpu_temp = tempfile.NamedTemporaryFile(
+                mode='w', suffix='_gpu_stress.py', delete=False, dir=os.getcwd()
             )
+            _gpu_temp.write(gpu_stress_code)
+            _gpu_temp.close()
+            _gpu_temp_file = _gpu_temp.name
+            print(f"GPU stress: launching subprocess with {_venv_python}")
+            gpu_process = subprocess.Popen(
+                [_venv_python, "-u", _gpu_temp_file],
+                env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id), "PYTHONUNBUFFERED": "1"}
+            )
+            # Brief check: did the subprocess crash immediately?
+            time.sleep(1)
+            rc = gpu_process.poll()
+            if rc is not None:
+                print(f"WARNING: GPU stress subprocess exited immediately with code {rc}")
+                gpu_process = None
+            else:
+                print(f"GPU stress subprocess running (PID {gpu_process.pid})")
         else:
             gpu_process = mp.Process(target=gpu_stress, args=(gpu_id,))
             gpu_process.daemon = True
@@ -526,5 +545,9 @@ while True:
             print("Cleanup completed.")
         else:
             print("Cleanup skipped.")
+
+        # Clean up GPU temp script if it was created
+        if _gpu_temp_file and os.path.exists(_gpu_temp_file):
+            os.remove(_gpu_temp_file)
 
         sys.exit(0)
