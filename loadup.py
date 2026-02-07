@@ -21,7 +21,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 SCRIPT_URL = "https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py"
 
 # Parse command-line arguments FIRST (before any setup)
@@ -341,7 +341,8 @@ COPY loadup.py /app/loadup.py
 WORKDIR /app
 RUN python3 -m venv /app/venv && \\
     . /app/venv/bin/activate && \\
-    pip install numpy psutil torch --index-url {pip_index}
+    pip install numpy psutil && \\
+    pip install torch --index-url {pip_index}
 """
     dockerfile_path = os.path.join(os.getcwd(), "Dockerfile")
     with open(dockerfile_path, "w") as f:
