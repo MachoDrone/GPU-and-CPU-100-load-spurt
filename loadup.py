@@ -21,7 +21,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 SCRIPT_URL = "https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py"
 
 # Parse command-line arguments FIRST (before any setup)
@@ -359,7 +359,7 @@ RUN python3 -m venv /app/venv && \\
     # Build docker run command -- pass all args EXCEPT --docker (bare metal inside container)
     print("Running stress test in Docker container...")
     docker_cmd = ["docker", "run", "--gpus", "all", "--rm"]
-    if os.isatty(sys.stdin.fileno()) or os.path.exists("/dev/tty"):
+    if os.isatty(sys.stdin.fileno()):
         docker_cmd.extend(["-it"])
     docker_cmd.extend([
         "loadup-gpu",
