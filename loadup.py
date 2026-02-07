@@ -8,7 +8,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(description="CPU/GPU Stress Test Script")
@@ -407,26 +407,20 @@ if __name__ == "__main__":
     print(f"\nStarting CPU and GPU stress test for {duration} seconds on GPU {gpu_id if gpu_id is not None else 'N/A'}. Press Ctrl+C to stop early.")
     print("Metrics will update every 5 seconds.\n")
 
-    # Start CPU stress processes (one per logical core)
-    num_cores = mp.cpu_count()
-    cpu_processes = [cpu_ctx.Process(target=cpu_stress_worker) for _ in range(num_cores)]
-    for p in cpu_processes:
-        p.daemon = True
-        p.start()
-
-    # Start GPU stress in a separate process if GPU available
+    # ── GPU stress FIRST (needs CPU to import torch before CPU saturation) ──
     gpu_process = None
     _gpu_temp_file = None  # Track temp file for cleanup
     if gpu_id is not None:
         if is_piped:
             # Piped mode: use subprocess with venv python to avoid spawn __file__ issue.
             # Write GPU code to a temp file (more reliable than -c for complex scripts).
+            # Split imports so we can see torch loading progress.
             gpu_stress_code = f"""#!/usr/bin/env python3
-import os, sys, torch
+import os, sys
 os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu_id}"
-print(f"GPU stress subprocess started (PID={{os.getpid()}})", flush=True)
-print(f"Torch version: {{torch.__version__}}", flush=True)
-print(f"CUDA version in Torch: {{torch.version.cuda}}", flush=True)
+print("GPU stress subprocess started, importing torch...", flush=True)
+import torch
+print(f"Torch loaded: {{torch.__version__}}, CUDA: {{torch.version.cuda}}", flush=True)
 if not torch.cuda.is_available():
     print("CUDA not available on GPU {gpu_id}. GPU stress disabled.", flush=True)
     sys.exit(1)
@@ -469,6 +463,34 @@ while True:
             gpu_process = mp.Process(target=gpu_stress, args=(gpu_id,))
             gpu_process.daemon = True
             gpu_process.start()
+
+        # Wait for GPU stress to initialize before saturating CPU.
+        # Torch import + CUDA init is CPU-intensive; CPU workers would starve it.
+        print("Waiting for GPU stress to become active before starting CPU stress...")
+        gpu_ready = False
+        for _wait in range(20):  # Up to 20 seconds
+            time.sleep(1)
+            metrics = get_gpu_metrics(gpu_id)
+            if metrics:
+                util_str = metrics.get("GPU Utilization", "0 %").strip()
+                # Check if GPU utilization is above 0%
+                if util_str and not util_str.startswith("0"):
+                    print(f"GPU stress active (utilization: {util_str}). Starting CPU stress...")
+                    gpu_ready = True
+                    break
+            # Also check if subprocess crashed
+            if is_piped and gpu_process and gpu_process.poll() is not None:
+                print(f"WARNING: GPU subprocess exited with code {gpu_process.returncode}")
+                break
+        if not gpu_ready:
+            print("GPU stress may still be initializing. Starting CPU stress anyway...")
+
+    # ── CPU stress AFTER GPU is active ──
+    num_cores = mp.cpu_count()
+    cpu_processes = [cpu_ctx.Process(target=cpu_stress_worker) for _ in range(num_cores)]
+    for p in cpu_processes:
+        p.daemon = True
+        p.start()
 
     start_time = time.time()
     try:
