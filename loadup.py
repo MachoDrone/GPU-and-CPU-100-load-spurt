@@ -577,7 +577,7 @@ while True:
             print_blue(f"  {key}: {value}")
 
         # Cleanup prompt
-        print("\nyou can cleanup now or cleanup later by running this script again")
+        print("\n.")
         if args.cleanup is not None:
             # Cleanup was specified via --cleanup or CLEANUP env var
             do_cleanup = args.cleanup == 'y'
