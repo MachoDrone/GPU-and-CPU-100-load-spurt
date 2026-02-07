@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 # ──────────────────────────────────────────────────────────
+# GPU/CPU 100% Load Test, Stress Test
+# Load your GPU(s) and CPU to 100% for a specified duration.
+#
 # Usage:
-#   curl -s https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py | python3 - --gpu 0 --duration 60 --cleanup y --docker y
+# curl -s https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py | python3 - --gpu 0 --duration 60 --cleanup y --docker y
 #
 # Arguments:
-#   --gpu N        GPU to stress: 0, 1, 0,2, or all
-#   --duration N   How many seconds to run the stress test
-#   --cleanup y|n  Remove venv and Docker artifacts after test
-#   --docker y|n   Run inside a Docker container (requires Docker + NVIDIA Container Toolkit)
+# --gpu N: GPU(s) to stress (e.g., 0  1  0,2  or all). N is the GPU index (device ordinal) from nvidia-smi (may differ from logical CUDA device IDs if CUDA_VISIBLE_DEVICES is set).
+# --duration N: Seconds to run the test (default: 60).
+# --cleanup y|n: Remove virtual env and Docker artifacts after test (default: y).
+# --docker y|n: Run inside a Docker container (requires Docker and NVIDIA Container Toolkit; default: y).
 #
-# Environment variables can be used instead of args:
-#   curl -s URL | GPU=0 DURATION=60 CLEANUP=y DOCKER=y python3 -
+# Use environment variables instead of args:
+# curl -s URL | GPU=0 DURATION=60 CLEANUP=y DOCKER=y python3 -
 # ──────────────────────────────────────────────────────────
 import subprocess
 import time
