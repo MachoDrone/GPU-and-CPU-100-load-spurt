@@ -21,7 +21,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 SCRIPT_URL = "https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py"
 
 # Parse command-line arguments FIRST (before any setup)
@@ -393,7 +393,8 @@ RUN python3 -m venv /app/venv && \\
 
     # Build docker run command -- pass all args EXCEPT --docker (bare metal inside container)
     print("Running stress test in Docker container...")
-    docker_cmd = ["docker", "run", "--gpus", "all", "--rm"]
+    docker_cmd = ["docker", "run", "--gpus", "all", "--rm",
+                   "-e", "LOADUP_DOCKER_HOST_MONITORS_POWER=1"]
     if os.isatty(sys.stdin.fileno()):
         docker_cmd.extend(["-it"])
     docker_cmd.extend([
@@ -896,20 +897,21 @@ while True:
         for key, value in storage_data.items():
             print_blue(f"  {key}: {value}")
 
-        # Peak power summary
-        print_blue("\nPeak Power During Stress Test:")
-        total_peak = 0.0
-        if peak_gpu_watts > 0:
-            print_blue(f"  GPU Peak: {peak_gpu_watts:.1f} W")
-            total_peak += peak_gpu_watts
-        if peak_cpu_watts > 0:
-            print_blue(f"  CPU Peak: {peak_cpu_watts:.1f} W")
-            total_peak += peak_cpu_watts
-        else:
-            print_blue("  CPU Peak: N/A (RAPL not available -- try running as root)")
-        if total_peak > 0:
-            print_blue(f"  Total Measured Peak: {total_peak:.1f} W"
-                       + (" (GPU only)" if peak_cpu_watts == 0 else " (GPU + CPU)"))
+        # Peak power summary (skip inside Docker -- host monitors power instead)
+        if not os.environ.get("LOADUP_DOCKER_HOST_MONITORS_POWER"):
+            print_blue("\nPeak Power During Stress Test:")
+            total_peak = 0.0
+            if peak_gpu_watts > 0:
+                print_blue(f"  GPU Peak: {peak_gpu_watts:.1f} W")
+                total_peak += peak_gpu_watts
+            if peak_cpu_watts > 0:
+                print_blue(f"  CPU Peak: {peak_cpu_watts:.1f} W")
+                total_peak += peak_cpu_watts
+            else:
+                print_blue("  CPU Peak: N/A (RAPL not available -- try running as root)")
+            if total_peak > 0:
+                print_blue(f"  Total Measured Peak: {total_peak:.1f} W"
+                           + (" (GPU only)" if peak_cpu_watts == 0 else " (GPU + CPU)"))
 
         # Cleanup prompt
         if args.cleanup is not None:
