@@ -21,7 +21,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 SCRIPT_URL = "https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py"
 
 # Parse command-line arguments FIRST (before any setup)
@@ -82,8 +82,18 @@ if is_piped:
 # AUTO-INSTALL SYSTEM DEPENDENCIES (hands-free operation)
 # ──────────────────────────────────────────────────────────
 
+def _get_sudo():
+    """Determine sudo command. Returns list like ['sudo'] or exits if no sudo available."""
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
+        return ["sudo"]
+    elif os.path.exists("/dev/tty"):
+        print("sudo password may be required...")
+        return ["sudo"]
+    else:
+        return None
+
 def install_system_deps():
-    """Detect and auto-install missing system packages."""
+    """Detect and auto-install missing system packages + fix RAPL permissions."""
     packages_needed = []
 
     # python3.X-venv: needed for virtual environment creation
@@ -101,56 +111,72 @@ def install_system_deps():
     except (subprocess.CalledProcessError, FileNotFoundError):
         packages_needed.append("lm-sensors")
 
-    if not packages_needed:
-        return  # All deps present
+    if packages_needed:
+        sudo = _get_sudo()
+        if not sudo:
+            print(f"Missing packages: {' '.join(packages_needed)}")
+            print(f"No sudo access. Please run: sudo apt install {' '.join(packages_needed)}")
+            sys.exit(1)
 
-    # Determine sudo mode:
-    # -n (passwordless) if available, otherwise regular sudo (prompts via /dev/tty)
-    has_passwordless_sudo = subprocess.run(
-        ["sudo", "-n", "true"], capture_output=True).returncode == 0
-    if has_passwordless_sudo:
-        sudo = ["sudo"]
-    elif os.path.exists("/dev/tty"):
-        # sudo will prompt for password on the terminal even in piped mode
-        print(f"Missing packages: {' '.join(packages_needed)}")
-        print("sudo password may be required...")
-        sudo = ["sudo"]
-    else:
-        print(f"Missing packages: {' '.join(packages_needed)}")
-        print(f"No sudo access and no terminal for password prompt.")
-        print(f"Please run manually: sudo apt install {' '.join(packages_needed)}")
-        sys.exit(1)
+        print(f"Installing system packages: {' '.join(packages_needed)}")
+        installed = False
 
-    print(f"Installing system packages: {' '.join(packages_needed)}")
-    installed = False
-
-    # Attempt 1: install directly (works if package cache exists)
-    r = subprocess.run(sudo + ["apt-get", "install", "-y"] + packages_needed)
-    if r.returncode == 0:
-        installed = True
-
-    # Attempt 2: update package lists, then install
-    if not installed:
-        print("Package cache outdated. Running apt-get update...")
-        subprocess.run(sudo + ["apt-get", "update"])
+        # Attempt 1: install directly (works if package cache exists)
         r = subprocess.run(sudo + ["apt-get", "install", "-y"] + packages_needed)
         if r.returncode == 0:
             installed = True
 
-    # Attempt 3: fix broken packages, then install
-    if not installed:
-        print("Attempting to fix broken packages...")
-        subprocess.run(sudo + ["apt-get", "install", "--fix-broken", "-y"])
-        r = subprocess.run(sudo + ["apt-get", "install", "-y"] + packages_needed)
-        if r.returncode == 0:
-            installed = True
+        # Attempt 2: update package lists, then install
+        if not installed:
+            print("Package cache outdated. Running apt-get update...")
+            subprocess.run(sudo + ["apt-get", "update"])
+            r = subprocess.run(sudo + ["apt-get", "install", "-y"] + packages_needed)
+            if r.returncode == 0:
+                installed = True
 
-    if installed:
-        print("System packages installed.")
+        # Attempt 3: fix broken packages, then install
+        if not installed:
+            print("Attempting to fix broken packages...")
+            subprocess.run(sudo + ["apt-get", "install", "--fix-broken", "-y"])
+            r = subprocess.run(sudo + ["apt-get", "install", "-y"] + packages_needed)
+            if r.returncode == 0:
+                installed = True
+
+        if installed:
+            print("System packages installed.")
+        else:
+            print(f"ERROR: Could not install packages automatically.")
+            print(f"Please run manually: sudo apt install {' '.join(packages_needed)}")
+            sys.exit(1)
+
+    # Intel RAPL: kernel interface for CPU power measurement
+    # Files exist but are root-only since kernel 5.10+. Make them world-readable.
+    rapl_energy = "/sys/class/powercap/intel-rapl:0/energy_uj"
+    if os.path.exists(rapl_energy):
+        try:
+            with open(rapl_energy) as f:
+                f.read()
+            # Already readable
+        except PermissionError:
+            print("Enabling CPU power monitoring (RAPL)...")
+            sudo = _get_sudo()
+            if sudo:
+                subprocess.run(sudo + ["chmod", "o+r", rapl_energy],
+                               capture_output=True)
+                # Also make max_energy_range_uj readable if present
+                rapl_max = rapl_energy.replace("energy_uj", "max_energy_range_uj")
+                if os.path.exists(rapl_max):
+                    subprocess.run(sudo + ["chmod", "o+r", rapl_max],
+                                   capture_output=True)
     else:
-        print(f"ERROR: Could not install packages automatically.")
-        print(f"Please run manually: sudo apt install {' '.join(packages_needed)}")
-        sys.exit(1)
+        # Try loading the kernel module
+        sudo = _get_sudo()
+        if sudo:
+            subprocess.run(sudo + ["modprobe", "intel_rapl_common"],
+                           capture_output=True)
+            if os.path.exists(rapl_energy):
+                subprocess.run(sudo + ["chmod", "o+r", rapl_energy],
+                               capture_output=True)
 
 install_system_deps()
 
@@ -363,6 +389,9 @@ RUN python3 -m venv /app/venv && \\
     # Build docker run command -- pass all args EXCEPT --docker (bare metal inside container)
     print("Running stress test in Docker container...")
     docker_cmd = ["docker", "run", "--gpus", "all", "--rm"]
+    # Mount RAPL sysfs for CPU power monitoring inside container
+    if os.path.exists("/sys/class/powercap"):
+        docker_cmd.extend(["-v", "/sys/class/powercap:/sys/class/powercap:ro"])
     if os.isatty(sys.stdin.fileno()):
         docker_cmd.extend(["-it"])
     docker_cmd.extend([
