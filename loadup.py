@@ -20,7 +20,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(
@@ -96,9 +96,14 @@ def install_system_deps():
 
     print(f"Installing missing system packages: {' '.join(packages_needed)}")
     try:
-        subprocess.check_call(["sudo", "apt-get", "update", "-qq"],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.check_call(["sudo", "apt-get", "install", "-y", "-qq"] + packages_needed)
+        # Try install directly first (works if package cache exists)
+        result = subprocess.run(["sudo", "apt-get", "install", "-y"] + packages_needed,
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            # Cache miss or stale -- update and retry
+            print("Updating package lists...")
+            subprocess.check_call(["sudo", "apt-get", "update"])
+            subprocess.check_call(["sudo", "apt-get", "install", "-y"] + packages_needed)
         print("System packages installed.")
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"ERROR: Failed to install packages: {e}")
