@@ -20,7 +20,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(
@@ -300,22 +300,15 @@ setup_docker()
 # ──────────────────────────────────────────────────────────
 
 def check_cuda_installed():
-    """Check for CUDA toolkit. Warn on mismatch, exit if missing."""
+    """Check for CUDA toolkit. Informational only -- PyTorch ships its own CUDA runtime."""
     try:
         output = subprocess.check_output(["nvcc", "--version"]).decode("utf-8")
         if "release 13.0" in output:
-            print("CUDA 13.0 detected.")
+            print("CUDA toolkit 13.0 detected.")
         else:
-            print("CUDA version mismatch. Expected 13.0.")
+            print("CUDA toolkit version mismatch (expected 13.0). PyTorch uses its own CUDA runtime.")
     except (subprocess.CalledProcessError, FileNotFoundError):
-        print("CUDA toolkit (nvcc) not found. Please install CUDA 13.0:")
-        print("  wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb")
-        print("  sudo dpkg -i cuda-keyring_1.1-1_all.deb")
-        print("  sudo apt update && sudo apt install cuda-toolkit-13-0")
-        print("Then add to ~/.bashrc:")
-        print("  export PATH=/usr/local/cuda-13.0/bin${PATH:+:${PATH}}")
-        print("  export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}")
-        sys.exit(1)
+        print("CUDA toolkit (nvcc) not found. Not required -- PyTorch ships its own CUDA runtime.")
 
 # ──────────────────────────────────────────────────────────
 # Virtual environment setup
