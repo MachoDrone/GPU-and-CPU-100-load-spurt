@@ -5,6 +5,93 @@ import multiprocessing as mp
 import sys
 import os
 import re
+import platform
+import argparse
+import tempfile
+import shutil
+
+VERSION = "1.0.0"
+print(f"Version: {VERSION}")
+time.sleep(3)
+
+# Detect if script is being piped (e.g., curl | python3 -)
+is_piped = not os.isatty(sys.stdin.fileno())
+
+if is_piped:
+    # Save piped input to a temporary file to allow execv
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
+        temp_file.write(sys.stdin.read())
+        temp_script = temp_file.name
+    os.chmod(temp_script, 0o755)
+    sys.argv[0] = temp_script  # Update argv for execv
+
+def is_in_docker():
+    """Check if running inside Docker container"""
+    return os.path.exists('/.dockerenv') or 'docker' in platform.uname().release.lower()
+
+def setup_docker():
+    """Build and run in Docker if not already in container"""
+    if is_in_docker():
+        print("Already running in Docker. Proceeding...")
+        return
+    
+    if is_piped:
+        print("Piped execution detected. Skipping Docker setup.")
+        return
+    
+    print("Not in Docker. Setting up container for reliability...")
+    
+    # Check if Docker is installed
+    try:
+        subprocess.check_output(["docker", "--version"])
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Docker not found. Please install Docker to enable containerized mode.")
+        print("Continuing without Docker...")
+        return
+    
+    # Generate Dockerfile in current dir
+    dockerfile_content = """
+FROM nvidia/cuda:13.0.0-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
+RUN apt-get update && apt-get install -y python3 python3-pip python3-venv lm-sensors && \\
+    rm -rf /var/lib/apt/lists/*
+
+COPY loadup.py /app/loadup.py
+
+WORKDIR /app
+
+RUN python3 -m venv /app/venv && \\
+    . /app/venv/bin/activate && \\
+    pip install numpy psutil torch --index-url https://download.pytorch.org/whl/cu130
+
+CMD ["/app/venv/bin/python", "/app/loadup.py"]
+"""
+    with open("Dockerfile", "w") as f:
+        f.write(dockerfile_content)
+    
+    # Build image
+    try:
+        subprocess.check_call(["docker", "build", "-t", "loadup-gpu", "."])
+    except subprocess.CalledProcessError as e:
+        print(f"Docker build failed: {e}. Continuing without Docker...")
+        return
+    
+    # Run container with GPU access, interactive if TTY, remove on exit
+    print("Running in Docker container...")
+    docker_cmd = [
+        "docker", "run", "--gpus", "all", "--rm",
+        "-v", f"{os.getcwd()}:/app",  # Mount current dir if needed
+        "loadup-gpu"
+    ]
+    if os.isatty(sys.stdin.fileno()):
+        docker_cmd.insert(3, "-it")  # Add -it only if TTY available
+    os.execvp("docker", docker_cmd)  # Replace current process with Docker run
+
+# Run Docker setup first
+setup_docker()
 
 def check_cuda_installed():
     try:
@@ -192,7 +279,17 @@ def get_storage_metrics():
 def print_blue(text):
     print(f"\033[94m{text}\033[0m")
 
+# Function to print in red
+def print_red(text):
+    print(f"\033[91m{text}\033[0m")
+
 if __name__ == "__main__":
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="CPU/GPU Stress Test Script")
+    parser.add_argument("--gpu", type=int, default=None, help="GPU number to stress (default: prompt or 0)")
+    parser.add_argument("--duration", type=int, default=None, help="Duration in seconds (default: prompt or 30)")
+    args = parser.parse_args()
+    
     # Set multiprocessing start method to 'spawn' for CUDA compatibility
     mp.set_start_method('spawn')
     
@@ -205,16 +302,28 @@ if __name__ == "__main__":
         print("Available GPUs:")
         for idx, name in gpus:
             print(f"{idx}: {name}")
-        gpu_input = input("Enter GPU number to stress (default 0): ").strip()
-        gpu_id = int(gpu_input) if gpu_input else 0
+        if args.gpu is not None:
+            gpu_id = args.gpu
+        elif os.isatty(sys.stdin.fileno()):
+            gpu_input = input("Enter GPU number to stress (default 0): ").strip()
+            gpu_id = int(gpu_input) if gpu_input else 0
+        else:
+            print("No TTY detected. Using default GPU 0.")
+            gpu_id = 0
         # Validate GPU ID
         if gpu_id not in [idx for idx, _ in gpus]:
             print(f"Invalid GPU number {gpu_id}. Exiting.")
             sys.exit(1)
     
     # Prompt for duration
-    duration_input = input("Enter number of seconds to run (default 30): ").strip()
-    duration = 30 if not duration_input else int(duration_input)
+    if args.duration is not None:
+        duration = args.duration
+    elif os.isatty(sys.stdin.fileno()):
+        duration_input = input("Enter number of seconds to run (default 30): ").strip()
+        duration = 30 if not duration_input else int(duration_input)
+    else:
+        print("No TTY detected. Using default duration 30 seconds.")
+        duration = 30
     
     print(f"Starting CPU and GPU stress test for {duration} seconds on GPU {gpu_id if gpu_id is not None else 'N/A'}. Press Ctrl+C to stop early.")
     print("Metrics will update every 5 seconds.\n")
@@ -264,7 +373,7 @@ if __name__ == "__main__":
         
         # Print final metrics in blue
         print_blue("-" * 40)
-        print_blue("Completed Full Load")
+        print_blue("Completed Full Load -- CHECK FOR IDLE/NORMALCY")
         if gpu_id is not None:
             gpu_data = get_gpu_metrics(gpu_id)
             if gpu_data:
@@ -286,5 +395,33 @@ if __name__ == "__main__":
         print_blue("\nStorage Metrics:")
         for key, value in storage_data.items():
             print_blue(f"{key}: {value}")
+        
+        # Cleanup prompt
+        print("\nyou can cleanup now or cleanup later by running this script again")
+        if os.isatty(sys.stdin.fileno()):
+            cleanup_input = input("\033[91mCleanup now? (Y/n): \033[0m").strip().lower()
+            do_cleanup = cleanup_input == '' or cleanup_input == 'y'
+        else:
+            print("No TTY detected. Skipping cleanup prompt (use Y/n interactively next time).")
+            do_cleanup = False
+        
+        if do_cleanup:
+            # Cleanup venv and Dockerfile
+            if os.path.exists('venv'):
+                shutil.rmtree('venv')
+            if os.path.exists('Dockerfile'):
+                os.remove('Dockerfile')
+            # Attempt to remove Docker image if exists
+            try:
+                subprocess.call(["docker", "rmi", "loadup-gpu"])
+            except:
+                pass
+            print("Cleanup completed.")
+        else:
+            print("Cleanup skipped.")
+        
+        # Clean up temp script if piped
+        if is_piped and 'temp_script' in globals():
+            os.remove(temp_script)
         
         sys.exit(0)
