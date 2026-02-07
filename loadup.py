@@ -8,7 +8,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(
@@ -584,7 +584,8 @@ while True:
             if os.path.exists('Dockerfile'):
                 os.remove('Dockerfile')
             try:
-                subprocess.call(["docker", "rmi", "loadup-gpu"])
+                subprocess.call(["docker", "rmi", "loadup-gpu"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
             print("Cleanup completed.")
