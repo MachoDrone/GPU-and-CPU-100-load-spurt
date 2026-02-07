@@ -1,4 +1,4 @@
-# Load your GPU and CPU 100% with customized durations.
+# Load your GPU(s) and CPU 100% with customized durations.
 ```
 #!/usr/bin/env python3
 # ──────────────────────────────────────────────────────────
