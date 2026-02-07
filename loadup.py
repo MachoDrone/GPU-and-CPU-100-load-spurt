@@ -9,7 +9,7 @@ import platform
 import argparse
 import tempfile
 
-VERSION = "0.0.8"
+VERSION = "0.0.9"
 print(f"Version: {VERSION}")
 time.sleep(3)
 
@@ -17,6 +17,7 @@ time.sleep(3)
 is_piped = not os.isatty(sys.stdin.fileno())
 
 if is_piped:
+    print("Piped execution detected. For interactive prompts, download and run as file instead: curl -s -O https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py && python3 loadup.py")
     # Save piped input to a temporary file to allow execv
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
         temp_file.write(sys.stdin.read())
@@ -64,9 +65,7 @@ WORKDIR /app
 
 RUN python3 -m venv /app/venv && \\
     . /app/venv/bin/activate && \\
-    pip install --upgrade pip && \\
-    pip install numpy psutil && \\
-    pip install torch --index-url https://download.pytorch.org/whl/cu130
+    pip install numpy psutil torch --index-url https://download.pytorch.org/whl/cu130
 
 CMD ["/app/venv/bin/python", "/app/loadup.py"]
 """
@@ -82,11 +81,13 @@ CMD ["/app/venv/bin/python", "/app/loadup.py"]
     
     # Run container with GPU access, interactive if TTY, remove on exit
     print("Running in Docker container...")
-    docker_cmd = ["docker", "run"]
-    docker_cmd += ["--gpus", "all"]
+    docker_cmd = [
+        "docker", "run", "--gpus", "all", "--rm",
+        "-v", f"{os.getcwd()}:/app",  # Mount current dir if needed
+        "loadup-gpu"
+    ]
     if os.isatty(sys.stdin.fileno()):
-        docker_cmd += ["-it"]
-    docker_cmd += ["--rm", "-v", f"{os.getcwd()}:/app", "loadup-gpu"]
+        docker_cmd.insert(3, "-it")  # Add -it only if TTY available
     os.execvp("docker", docker_cmd)  # Replace current process with Docker run
 
 # Run Docker setup first
