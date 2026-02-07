@@ -8,9 +8,8 @@ import re
 import platform
 import argparse
 import tempfile
-import shutil
 
-VERSION = "1.0.0"
+VERSION = "0.0.8"
 print(f"Version: {VERSION}")
 time.sleep(3)
 
@@ -45,13 +44,13 @@ def setup_docker():
     try:
         subprocess.check_output(["docker", "--version"])
     except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Docker not found. Please install Docker to enable containerized mode.")
+        print("Docker not found. Please install Docker to enable containerized mode for better reliability.")
         print("Continuing without Docker...")
         return
     
     # Generate Dockerfile in current dir
     dockerfile_content = """
-FROM nvidia/cuda:13.0.0-devel-ubuntu22.04
+FROM nvidia/cuda:13.0.0-base-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
@@ -65,7 +64,9 @@ WORKDIR /app
 
 RUN python3 -m venv /app/venv && \\
     . /app/venv/bin/activate && \\
-    pip install numpy psutil torch --index-url https://download.pytorch.org/whl/cu130
+    pip install --upgrade pip && \\
+    pip install numpy psutil && \\
+    pip install torch --index-url https://download.pytorch.org/whl/cu130
 
 CMD ["/app/venv/bin/python", "/app/loadup.py"]
 """
@@ -75,19 +76,17 @@ CMD ["/app/venv/bin/python", "/app/loadup.py"]
     # Build image
     try:
         subprocess.check_call(["docker", "build", "-t", "loadup-gpu", "."])
-    except subprocess.CalledProcessError as e:
-        print(f"Docker build failed: {e}. Continuing without Docker...")
+    except subprocess.CalledProcessError:
+        print("Docker build failed. Continuing without Docker...")
         return
     
     # Run container with GPU access, interactive if TTY, remove on exit
     print("Running in Docker container...")
-    docker_cmd = [
-        "docker", "run", "--gpus", "all", "--rm",
-        "-v", f"{os.getcwd()}:/app",  # Mount current dir if needed
-        "loadup-gpu"
-    ]
+    docker_cmd = ["docker", "run"]
+    docker_cmd += ["--gpus", "all"]
     if os.isatty(sys.stdin.fileno()):
-        docker_cmd.insert(3, "-it")  # Add -it only if TTY available
+        docker_cmd += ["-it"]
+    docker_cmd += ["--rm", "-v", f"{os.getcwd()}:/app", "loadup-gpu"]
     os.execvp("docker", docker_cmd)  # Replace current process with Docker run
 
 # Run Docker setup first
@@ -408,7 +407,7 @@ if __name__ == "__main__":
         if do_cleanup:
             # Cleanup venv and Dockerfile
             if os.path.exists('venv'):
-                shutil.rmtree('venv')
+                subprocess.call(["rm", "-rf", "venv"])
             if os.path.exists('Dockerfile'):
                 os.remove('Dockerfile')
             # Attempt to remove Docker image if exists
