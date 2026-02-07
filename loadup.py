@@ -20,7 +20,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.2.4"
+VERSION = "0.3.0"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(
@@ -145,6 +145,50 @@ def install_system_deps():
 install_system_deps()
 
 # ──────────────────────────────────────────────────────────
+# DETECT CUDA VERSION FROM NVIDIA DRIVER
+# ──────────────────────────────────────────────────────────
+
+def detect_cuda_version():
+    """Parse nvidia-smi to get the max CUDA version the driver supports.
+    Returns the best matching PyTorch CUDA wheel tag (e.g., 'cu126')."""
+    try:
+        output = subprocess.check_output(["nvidia-smi"]).decode("utf-8")
+        match = re.search(r"CUDA Version:\s+([\d.]+)", output)
+        if not match:
+            print("WARNING: Could not parse CUDA version from nvidia-smi.")
+            return None
+        cuda_ver = match.group(1)  # e.g., "12.0", "12.6", "13.0"
+        major, minor = [int(x) for x in cuda_ver.split(".")[:2]]
+        print(f"NVIDIA driver supports CUDA {cuda_ver}")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("WARNING: nvidia-smi not found. Cannot detect CUDA version.")
+        return None
+
+    # Map driver CUDA version to best matching PyTorch wheel.
+    # Rule: driver CUDA version must be >= PyTorch CUDA build version.
+    # Available PyTorch wheels: cu118, cu121, cu124, cu126, cu130
+    if major >= 13:
+        tag = "cu130"
+    elif major == 12 and minor >= 6:
+        tag = "cu126"
+    elif major == 12 and minor >= 4:
+        tag = "cu124"
+    elif major == 12 and minor >= 1:
+        tag = "cu121"
+    elif major >= 11 and (major > 11 or minor >= 8):
+        tag = "cu118"
+    else:
+        print(f"WARNING: CUDA {cuda_ver} is too old for PyTorch GPU support (need >= 11.8).")
+        print("Please update your NVIDIA driver: https://www.nvidia.com/Download/index.aspx")
+        return None
+
+    print(f"Using PyTorch CUDA build: {tag}")
+    return tag
+
+cuda_tag = detect_cuda_version()
+torch_index_url = f"https://download.pytorch.org/whl/{cuda_tag}" if cuda_tag else None
+
+# ──────────────────────────────────────────────────────────
 # EARLY PROMPTS: GPU selection and duration BEFORE any setup
 # ──────────────────────────────────────────────────────────
 
@@ -265,7 +309,7 @@ WORKDIR /app
 
 RUN python3 -m venv /app/venv && \\
     . /app/venv/bin/activate && \\
-    pip install numpy psutil torch --index-url https://download.pytorch.org/whl/cu130
+    pip install numpy psutil torch --index-url {torch_index_url or 'https://download.pytorch.org/whl/cu126'}
 
 CMD ["/app/venv/bin/python", "/app/loadup.py"]
 """
@@ -303,12 +347,9 @@ def check_cuda_installed():
     """Check for CUDA toolkit. Informational only -- PyTorch ships its own CUDA runtime."""
     try:
         output = subprocess.check_output(["nvcc", "--version"]).decode("utf-8")
-        if "release 13.0" in output:
-            print("CUDA toolkit 13.0 detected.")
-        else:
-            print("CUDA toolkit version mismatch (expected 13.0). PyTorch uses its own CUDA runtime.")
+        print(f"CUDA toolkit found: {output.strip().splitlines()[-1]}")
     except (subprocess.CalledProcessError, FileNotFoundError):
-        print("CUDA toolkit (nvcc) not found. Not required -- PyTorch ships its own CUDA runtime.")
+        print("CUDA toolkit (nvcc) not installed. Not required -- PyTorch ships its own CUDA runtime.")
 
 # ──────────────────────────────────────────────────────────
 # Virtual environment setup
@@ -341,7 +382,11 @@ if sys.prefix == sys.base_prefix:
     # Install dependencies in the venv
     subprocess.check_call([venv_pip, 'install', 'numpy', 'psutil'])
     subprocess.check_call([venv_pip, 'uninstall', '-y', 'torch', 'torchaudio', 'torchvision'])
-    subprocess.check_call([venv_pip, 'install', 'torch', '--index-url', 'https://download.pytorch.org/whl/cu130'])
+    if torch_index_url:
+        subprocess.check_call([venv_pip, 'install', 'torch', '--index-url', torch_index_url])
+    else:
+        # CPU-only fallback if no CUDA detected
+        subprocess.check_call([venv_pip, 'install', 'torch'])
 
     if is_piped:
         # Piped mode: os.execv won't work because Python already consumed stdin
