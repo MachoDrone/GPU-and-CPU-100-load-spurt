@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # ──────────────────────────────────────────────────────────
 # Usage:
-#   curl -s https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py | python3 - --gpu 0 --duration 60 --cleanup y
+#   curl -s https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py | python3 - --gpu 0 --duration 60 --cleanup y --docker y
 #
 # Arguments:
 #   --gpu N        GPU number to stress test (0, 1, 2, etc.)
 #   --duration N   How many seconds to run the stress test
 #   --cleanup y|n  Remove venv and Docker artifacts after test
+#   --docker y|n   Run inside a Docker container (requires Docker + NVIDIA Container Toolkit)
 #
 # Environment variables can be used instead of args:
-#   curl -s URL | GPU=0 DURATION=60 CLEANUP=y python3 -
+#   curl -s URL | GPU=0 DURATION=60 CLEANUP=y DOCKER=y python3 -
 # ──────────────────────────────────────────────────────────
 import subprocess
 import time
@@ -20,7 +21,8 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.3.0"
+VERSION = "0.4.0"
+SCRIPT_URL = "https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(
@@ -29,11 +31,11 @@ parser = argparse.ArgumentParser(
   GPU=N         GPU number to stress (same as --gpu)
   DURATION=N    Duration in seconds (same as --duration)
   CLEANUP=y|n   Auto-cleanup after test (same as --cleanup)
+  DOCKER=y|n    Run inside Docker container (same as --docker)
 
 Piped usage examples:
-  curl -s URL | python3 -                                    # defaults: GPU 0, 30s, no cleanup
-  curl -s URL | python3 - --gpu 2 --duration 60 --cleanup y  # CLI args
-  curl -s URL | GPU=2 DURATION=60 CLEANUP=y python3 -        # env vars
+  curl -s URL | python3 - --gpu 0 --duration 60 --cleanup y             # on host
+  curl -s URL | python3 - --gpu 0 --duration 60 --cleanup y --docker y  # in Docker
 """,
     formatter_class=argparse.RawDescriptionHelpFormatter
 )
@@ -41,6 +43,8 @@ parser.add_argument("--gpu", type=int, default=None, help="GPU number to stress 
 parser.add_argument("--duration", type=int, default=None, help="Duration in seconds (default: prompt or 30)")
 parser.add_argument("--cleanup", type=str, default=None, choices=["y", "n"],
                     help="Cleanup venv/Dockerfile after test: y or n (default: prompt or skip)")
+parser.add_argument("--docker", type=str, default=None, choices=["y", "n"],
+                    help="Run inside Docker container: y or n (requires Docker + NVIDIA Container Toolkit)")
 args = parser.parse_args()
 
 # Apply environment variable fallbacks (CLI args take priority)
@@ -50,6 +54,8 @@ if args.duration is None and os.environ.get("DURATION", "").strip().isdigit():
     args.duration = int(os.environ["DURATION"])
 if args.cleanup is None and os.environ.get("CLEANUP", "").strip().lower() in ("y", "n"):
     args.cleanup = os.environ["CLEANUP"].strip().lower()
+if args.docker is None and os.environ.get("DOCKER", "").strip().lower() in ("y", "n"):
+    args.docker = os.environ["DOCKER"].strip().lower()
 
 print(f"Version: {VERSION}")
 
@@ -58,10 +64,10 @@ is_piped = not os.isatty(sys.stdin.fileno())
 
 if is_piped:
     print("Piped execution detected. To customize, use CLI args or env vars:")
-    print("  curl -s URL | python3 - --gpu 2 --duration 60 --cleanup y")
-    print("  curl -s URL | GPU=2 DURATION=60 CLEANUP=y python3 -")
+    print("  curl -s URL | python3 - --gpu 0 --duration 60 --cleanup y")
+    print("  curl -s URL | python3 - --gpu 0 --duration 60 --cleanup y --docker y")
     print("For interactive prompts, download and run as file instead:")
-    print("  curl -s -O https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py && python3 loadup.py")
+    print(f"  curl -s -O {SCRIPT_URL} && python3 loadup.py")
     # Drain any remaining stdin so it doesn't interfere with subprocesses
     try:
         sys.stdin.read()
@@ -245,13 +251,14 @@ if args.duration is None:
 else:
     print(f"Using duration {args.duration}s (from {'--duration' if '--duration' in sys.argv else 'DURATION env var'}).")
 
-# Inject --gpu, --duration, --cleanup into sys.argv so they carry through os.execv
+# Inject resolved args into sys.argv so they carry through os.execv
 def ensure_args_in_argv():
-    """Make sure --gpu, --duration, --cleanup are in sys.argv for re-execution"""
+    """Make sure --gpu, --duration, --cleanup, --docker are in sys.argv for re-execution"""
     new_argv = [sys.argv[0]]
+    skip_args = ('--gpu', '--duration', '--cleanup', '--docker')
     i = 1
     while i < len(sys.argv):
-        if sys.argv[i] in ('--gpu', '--duration', '--cleanup') and i + 1 < len(sys.argv):
+        if sys.argv[i] in skip_args and i + 1 < len(sys.argv):
             i += 2  # Skip existing arg and its value
         else:
             new_argv.append(sys.argv[i])
@@ -262,12 +269,13 @@ def ensure_args_in_argv():
         new_argv.extend(["--duration", str(args.duration)])
     if args.cleanup is not None:
         new_argv.extend(["--cleanup", str(args.cleanup)])
+    # NOTE: --docker is NOT passed through (container runs on bare metal inside)
     sys.argv = new_argv
 
 ensure_args_in_argv()
 
 # ──────────────────────────────────────────────────────────
-# Docker detection and setup
+# Docker setup (--docker y)
 # ──────────────────────────────────────────────────────────
 
 def is_in_docker():
@@ -275,68 +283,105 @@ def is_in_docker():
     return os.path.exists('/.dockerenv') or 'docker' in platform.uname().release.lower()
 
 def setup_docker():
-    """Build and run in Docker if not already in container"""
+    """Build and run stress test in a Docker container."""
+    if args.docker != 'y':
+        return  # Docker not requested
+
     if is_in_docker():
         print("Already running in Docker. Proceeding...")
         return
 
-    if is_piped:
-        return  # Docker setup not supported in piped mode
+    print("Docker mode requested. Setting up container...")
 
-    print("Not in Docker. Setting up container for reliability...")
-
-    # Check if Docker is installed
+    # Check Docker is installed
     try:
-        subprocess.check_output(["docker", "--version"])
+        subprocess.check_output(["docker", "--version"], stderr=subprocess.DEVNULL)
     except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Docker not found. Please install Docker to enable containerized mode for better reliability.")
-        print("Continuing without Docker...")
-        return
+        print("ERROR: Docker not found. Install Docker + NVIDIA Container Toolkit first.")
+        print("  https://docs.docker.com/engine/install/")
+        print("  https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html")
+        sys.exit(1)
 
-    # Generate Dockerfile in current dir
-    dockerfile_content = """
-FROM nvidia/cuda:13.0.0-base-ubuntu22.04
+    # Check NVIDIA Container Toolkit (docker --gpus)
+    r = subprocess.run(["docker", "run", "--rm", "--gpus", "all", "ubuntu:22.04", "true"],
+                       capture_output=True, timeout=30)
+    if r.returncode != 0:
+        print("ERROR: NVIDIA Container Toolkit not working (docker --gpus all failed).")
+        print("  Install: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html")
+        sys.exit(1)
 
+    # Download the script to a real file (needed for Docker COPY)
+    script_path = os.path.join(os.getcwd(), "loadup.py")
+    if not os.path.exists(script_path):
+        print(f"Downloading script to {script_path}...")
+        try:
+            import urllib.request
+            urllib.request.urlretrieve(SCRIPT_URL, script_path)
+        except Exception as e:
+            print(f"ERROR: Failed to download script: {e}")
+            sys.exit(1)
+
+    # Map CUDA tag to Docker base image
+    cuda_docker_images = {
+        "cu118": "nvidia/cuda:11.8.0-base-ubuntu22.04",
+        "cu121": "nvidia/cuda:12.1.0-base-ubuntu22.04",
+        "cu124": "nvidia/cuda:12.4.0-base-ubuntu22.04",
+        "cu126": "nvidia/cuda:12.6.0-base-ubuntu22.04",
+        "cu130": "nvidia/cuda:13.0.0-base-ubuntu22.04",
+    }
+    base_image = cuda_docker_images.get(cuda_tag, "nvidia/cuda:12.6.0-base-ubuntu22.04")
+    pip_index = torch_index_url or "https://download.pytorch.org/whl/cu126"
+
+    dockerfile_content = f"""FROM {base_image}
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
-
 RUN apt-get update && apt-get install -y python3 python3-pip python3-venv lm-sensors && \\
     rm -rf /var/lib/apt/lists/*
-
 COPY loadup.py /app/loadup.py
-
 WORKDIR /app
-
 RUN python3 -m venv /app/venv && \\
     . /app/venv/bin/activate && \\
-    pip install numpy psutil torch --index-url {torch_index_url or 'https://download.pytorch.org/whl/cu126'}
-
-CMD ["/app/venv/bin/python", "/app/loadup.py"]
+    pip install numpy psutil torch --index-url {pip_index}
 """
-    with open("Dockerfile", "w") as f:
+    dockerfile_path = os.path.join(os.getcwd(), "Dockerfile")
+    with open(dockerfile_path, "w") as f:
         f.write(dockerfile_content)
 
     # Build image
+    print("Building Docker image (this may take a few minutes on first run)...")
     try:
         subprocess.check_call(["docker", "build", "-t", "loadup-gpu", "."])
     except subprocess.CalledProcessError:
-        print("Docker build failed. Continuing without Docker...")
-        return
+        print("ERROR: Docker build failed.")
+        sys.exit(1)
 
-    # Run container with GPU access, interactive if TTY, remove on exit
-    print("Running in Docker container...")
-    docker_cmd = [
-        "docker", "run", "--gpus", "all", "--rm",
-        "-v", f"{os.getcwd()}:/app",  # Mount current dir if needed
+    # Build docker run command -- pass all args EXCEPT --docker (bare metal inside container)
+    print("Running stress test in Docker container...")
+    docker_cmd = ["docker", "run", "--gpus", "all", "--rm"]
+    if os.isatty(sys.stdin.fileno()) or os.path.exists("/dev/tty"):
+        docker_cmd.extend(["-it"])
+    docker_cmd.extend([
         "loadup-gpu",
         "/app/venv/bin/python", "/app/loadup.py",
         "--gpu", str(args.gpu), "--duration", str(args.duration),
-    ] + (["--cleanup", args.cleanup] if args.cleanup else [])
-    if os.isatty(sys.stdin.fileno()):
-        docker_cmd.insert(3, "-it")  # Add -it only if TTY available
-    os.execvp("docker", docker_cmd)  # Replace current process with Docker run
+    ])
+    if args.cleanup:
+        docker_cmd.extend(["--cleanup", args.cleanup])
 
-# Run Docker setup first
+    ret = subprocess.call(docker_cmd)
+
+    # Cleanup Docker artifacts on host
+    if args.cleanup == 'y':
+        if os.path.exists(dockerfile_path):
+            os.remove(dockerfile_path)
+        if is_piped and os.path.exists(script_path):
+            os.remove(script_path)
+        subprocess.call(["docker", "rmi", "loadup-gpu"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("Docker artifacts cleaned up.")
+
+    sys.exit(ret)
+
 setup_docker()
 
 # ──────────────────────────────────────────────────────────
