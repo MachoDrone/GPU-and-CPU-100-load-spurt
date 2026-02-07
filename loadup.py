@@ -21,7 +21,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 SCRIPT_URL = "https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py"
 
 # Parse command-line arguments FIRST (before any setup)
@@ -590,6 +590,43 @@ def get_storage_metrics():
         "Disk Write Rate": f"{write_rate:.2f} MB/s"
     }
 
+# Function to get CPU package power via Intel RAPL (best effort)
+def get_cpu_power():
+    """Read CPU package power from RAPL. Returns watts or None if unavailable."""
+    rapl_paths = [
+        "/sys/class/powercap/intel-rapl:0/energy_uj",      # Intel
+        "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj",  # Alternative
+    ]
+    energy_path = None
+    for p in rapl_paths:
+        if os.path.exists(p):
+            energy_path = p
+            break
+    if not energy_path:
+        return None
+    try:
+        with open(energy_path) as f:
+            e1 = int(f.read().strip())
+        time.sleep(0.5)
+        with open(energy_path) as f:
+            e2 = int(f.read().strip())
+        watts = (e2 - e1) / 500_000  # microjoules over 0.5s -> watts
+        return round(watts, 1)
+    except Exception:
+        return None
+
+# Function to parse GPU power from metrics dict (returns float watts or None)
+def parse_gpu_power(gpu_data):
+    """Extract numeric GPU power draw from metrics dict."""
+    if not gpu_data:
+        return None
+    try:
+        power_str = gpu_data.get("Power Usage/Cap", "")
+        draw_str = power_str.split("/")[0].strip().replace(" W", "")
+        return float(draw_str)
+    except Exception:
+        return None
+
 # Function to print metrics in blue
 def print_blue(text):
     print(f"\033[94m{text}\033[0m")
@@ -705,6 +742,10 @@ while True:
         p.daemon = True
         p.start()
 
+    # Track peak power during stress test
+    peak_gpu_watts = 0.0
+    peak_cpu_watts = 0.0
+
     start_time = time.time()
     try:
         while time.time() - start_time < duration:
@@ -714,8 +755,17 @@ while True:
                     print("GPU Metrics:")
                     for key, value in gpu_data.items():
                         print(f"  {key}: {value}")
+                    gw = parse_gpu_power(gpu_data)
+                    if gw and gw > peak_gpu_watts:
+                        peak_gpu_watts = gw
+
+            cpu_power = get_cpu_power()
+            if cpu_power and cpu_power > peak_cpu_watts:
+                peak_cpu_watts = cpu_power
 
             cpu_data = get_cpu_metrics()
+            if cpu_power is not None:
+                cpu_data["CPU Power"] = f"{cpu_power} W"
             print("\nCPU Metrics:")
             for key, value in cpu_data.items():
                 print(f"  {key}: {value}")
@@ -758,6 +808,22 @@ while True:
         print_blue("\nStorage Metrics:")
         for key, value in storage_data.items():
             print_blue(f"  {key}: {value}")
+
+        # Peak power summary
+        print_blue("\nPeak Power During Stress Test:")
+        total_peak = 0.0
+        if peak_gpu_watts > 0:
+            print_blue(f"  GPU Peak: {peak_gpu_watts:.1f} W")
+            total_peak += peak_gpu_watts
+        if peak_cpu_watts > 0:
+            print_blue(f"  CPU Peak: {peak_cpu_watts:.1f} W")
+            total_peak += peak_cpu_watts
+        else:
+            print_blue("  CPU Peak: N/A (RAPL not available -- try running as root)")
+        print_blue(f"  RAM Power: N/A (not measurable via software)")
+        if total_peak > 0:
+            print_blue(f"  Total Measured Peak: {total_peak:.1f} W"
+                       + (" (GPU only)" if peak_cpu_watts == 0 else " (GPU + CPU)"))
 
         # Cleanup prompt
         if args.cleanup is not None:
