@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# ──────────────────────────────────────────────────────────
+# Usage:
+#   curl -s https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py | python3 - --gpu 0 --duration 60 --cleanup y
+#
+# Arguments:
+#   --gpu N        GPU number to stress test (0, 1, 2, etc.)
+#   --duration N   How many seconds to run the stress test
+#   --cleanup y|n  Remove venv and Docker artifacts after test
+#
+# Environment variables can be used instead of args:
+#   curl -s URL | GPU=0 DURATION=60 CLEANUP=y python3 -
+# ──────────────────────────────────────────────────────────
 import subprocess
 import time
 import multiprocessing as mp
@@ -8,7 +20,7 @@ import re
 import platform
 import argparse
 import tempfile
-VERSION = "0.1.8"
+VERSION = "0.1.9"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(
@@ -577,7 +589,6 @@ while True:
             print_blue(f"  {key}: {value}")
 
         # Cleanup prompt
-        print("\n.")
         if args.cleanup is not None:
             # Cleanup was specified via --cleanup or CLEANUP env var
             do_cleanup = args.cleanup == 'y'
