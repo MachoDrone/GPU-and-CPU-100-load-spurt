@@ -7,9 +7,7 @@ import os
 import re
 import platform
 import argparse
-import tempfile
-
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # Parse command-line arguments FIRST (before any setup)
 parser = argparse.ArgumentParser(description="CPU/GPU Stress Test Script")
@@ -23,13 +21,13 @@ print(f"Version: {VERSION}")
 is_piped = not os.isatty(sys.stdin.fileno())
 
 if is_piped:
-    print("Piped execution detected. For interactive prompts, download and run as file instead: curl -s -O https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py && python3 loadup.py")
-    # Save piped input to a temporary file to allow execv
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
-        temp_file.write(sys.stdin.read())
-        temp_script = temp_file.name
-    os.chmod(temp_script, 0o755)
-    sys.argv[0] = temp_script  # Update argv for execv
+    print("Piped execution detected. For interactive prompts, download and run as file instead:")
+    print("  curl -s -O https://raw.githubusercontent.com/MachoDrone/GPU-and-CPU-100-load-spurt/refs/heads/main/loadup.py && python3 loadup.py")
+    # Drain any remaining stdin so it doesn't interfere with subprocesses
+    try:
+        sys.stdin.read()
+    except Exception:
+        pass
 
 # ──────────────────────────────────────────────────────────
 # EARLY PROMPTS: GPU selection and duration BEFORE any setup
@@ -88,7 +86,6 @@ if args.gpu is None or args.duration is None:
 # Inject --gpu and --duration into sys.argv so they carry through os.execv
 def ensure_args_in_argv():
     """Make sure --gpu and --duration are in sys.argv for re-execution"""
-    argv_str = " ".join(sys.argv)
     new_argv = [sys.argv[0]]
     i = 1
     while i < len(sys.argv):
@@ -208,7 +205,7 @@ def check_cuda_installed():
         sys.exit(1)
 
 # ──────────────────────────────────────────────────────────
-# Virtual environment setup (re-executes with --gpu/--duration)
+# Virtual environment setup
 # ──────────────────────────────────────────────────────────
 
 # Check if running in a virtual environment
@@ -226,12 +223,28 @@ if sys.prefix == sys.base_prefix:
     subprocess.check_call([venv_pip, 'uninstall', '-y', 'torch', 'torchaudio', 'torchvision'])
     subprocess.check_call([venv_pip, 'install', 'torch', '--index-url', 'https://download.pytorch.org/whl/cu130'])
 
-    print("Starting script in virtual environment...")
-    # sys.argv already contains --gpu and --duration from ensure_args_in_argv()
-    os.execv(venv_python, [venv_python] + sys.argv)
+    if is_piped:
+        # Piped mode: os.execv won't work because Python already consumed stdin
+        # (the temp file would be empty). Activate venv inline instead.
+        print("Activating virtual environment inline (piped mode)...")
+        import site
+        venv_lib = os.path.join(os.path.abspath(venv_dir), 'lib')
+        # Find the pythonX.Y directory inside venv/lib/
+        python_dirs = [d for d in os.listdir(venv_lib) if d.startswith('python')]
+        if python_dirs:
+            venv_site = os.path.join(venv_lib, python_dirs[0], 'site-packages')
+            sys.path.insert(0, venv_site)
+            site.addsitedir(venv_site)
+        else:
+            print("ERROR: Could not find venv site-packages. Exiting.")
+            sys.exit(1)
+    else:
+        print("Starting script in virtual environment...")
+        # sys.argv already contains --gpu and --duration from ensure_args_in_argv()
+        os.execv(venv_python, [venv_python] + sys.argv)
 
 # ──────────────────────────────────────────────────────────
-# Now import the dependencies (we are in venv)
+# Now import the dependencies (we are in venv or activated inline)
 # ──────────────────────────────────────────────────────────
 import numpy as np
 import psutil
@@ -470,9 +483,5 @@ if __name__ == "__main__":
             print("Cleanup completed.")
         else:
             print("Cleanup skipped.")
-
-        # Clean up temp script if piped
-        if is_piped and 'temp_script' in globals():
-            os.remove(temp_script)
 
         sys.exit(0)
